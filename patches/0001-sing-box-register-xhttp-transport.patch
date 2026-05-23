@@ -1,0 +1,108 @@
+Subject: [PATCH] add xhttp v2ray transport type
+
+Minimal hook for routing the "xhttp" transport type to an external
+implementation. Apply at sing-box repo root with:
+  git apply 0001-sing-box-register-xhttp-transport.patch
+
+After applying, build sing-box with an import side-effect package that
+calls xhttp.Register(), or call it directly from main().
+
+--- a/constant/v2ray.go
++++ b/constant/v2ray.go
+@@
+ V2RayTransportTypeHTTPUpgrade = "httpupgrade"
++V2RayTransportTypeXHTTP       = "xhttp"
+--- a/option/v2ray_transport.go
++++ b/option/v2ray_transport.go
+@@
+ 	HTTPUpgradeOptions V2RayHTTPUpgradeOptions `json:"-"`
++	XHTTPOptions       V2RayXHTTPOptions       `json:"-"`
+ }
+@@
+ 	case C.V2RayTransportTypeHTTPUpgrade:
+ 		v = o.HTTPUpgradeOptions
++	case C.V2RayTransportTypeXHTTP:
++		v = o.XHTTPOptions
+@@
+ 	case C.V2RayTransportTypeHTTPUpgrade:
+ 		v = &o.HTTPUpgradeOptions
++	case C.V2RayTransportTypeXHTTP:
++		v = &o.XHTTPOptions
+--- a/transport/v2ray/transport.go
++++ b/transport/v2ray/transport.go
+@@
+ 	case C.V2RayTransportTypeHTTPUpgrade:
+ 		return v2rayhttpupgrade.NewServer(ctx, logger, options.HTTPUpgradeOptions, tlsConfig, handler)
++	case C.V2RayTransportTypeXHTTP:
++		if xhttpServerCtor == nil {
++			return nil, E.New("xhttp transport not registered")
++		}
++		return xhttpServerCtor(ctx, logger, options.XHTTPOptions, tlsConfig, handler)
+@@
+ 	case C.V2RayTransportTypeHTTPUpgrade:
+ 		return v2rayhttpupgrade.NewClient(ctx, dialer, serverAddr, options.HTTPUpgradeOptions, tlsConfig)
++	case C.V2RayTransportTypeXHTTP:
++		if xhttpClientCtor == nil {
++			return nil, E.New("xhttp transport not registered")
++		}
++		return xhttpClientCtor(ctx, dialer, serverAddr, options.XHTTPOptions, tlsConfig)
+
+--- a/transport/v2ray/xhttp_register.go (new file)
++++ b/transport/v2ray/xhttp_register.go
++package v2ray
++
++import (
++	"context"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/common/tls"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/common/logger"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++)
++
++type (
++	XHTTPServerCtor func(ctx context.Context, logger logger.ContextLogger, options option.V2RayXHTTPOptions, tlsConfig tls.ServerConfig, handler adapter.V2RayServerTransportHandler) (adapter.V2RayServerTransport, error)
++	XHTTPClientCtor func(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, options option.V2RayXHTTPOptions, tlsConfig tls.Config) (adapter.V2RayClientTransport, error)
++)
++
++var (
++	xhttpServerCtor XHTTPServerCtor
++	xhttpClientCtor XHTTPClientCtor
++)
++
++// RegisterXHTTP wires an external xhttp transport implementation into the v2ray
++// transport factory. Call from an init() in your build's main package.
++func RegisterXHTTP(s XHTTPServerCtor, c XHTTPClientCtor) {
++	xhttpServerCtor = s
++	xhttpClientCtor = c
++}
+
+--- a/option/v2ray_xhttp.go (new file)
++++ b/option/v2ray_xhttp.go
++package option
++
++import "github.com/sagernet/sing/common/json/badoption"
++
++type V2RayXHTTPOptions struct {
++	Mode    string               `json:"mode,omitempty"`     // "packet-up" | "stream-up"
++	Host    string               `json:"host,omitempty"`
++	Path    string               `json:"path,omitempty"`
++	Method  string               `json:"method,omitempty"`
++	Headers badoption.HTTPHeader `json:"headers,omitempty"`
++
++	NoGRPCHeader bool `json:"no_grpc_header,omitempty"`
++	NoSSEHeader  bool `json:"no_sse_header,omitempty"`
++
++	XPaddingBytes        *XHTTPRange `json:"x_padding_bytes,omitempty"`
++	ScMaxEachPostBytes   *XHTTPRange `json:"sc_max_each_post_bytes,omitempty"`
++	ScMaxBufferedPosts   int32       `json:"sc_max_buffered_posts,omitempty"`
++	ScMinPostsIntervalMs *XHTTPRange `json:"sc_min_posts_interval_ms,omitempty"`
++	ScStreamUpServerSecs *XHTTPRange `json:"sc_stream_up_server_secs,omitempty"`
++}
++
++type XHTTPRange struct {
++	From int32 `json:"from,omitempty"`
++	To   int32 `json:"to,omitempty"`
++}
