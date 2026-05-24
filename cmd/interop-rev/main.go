@@ -18,7 +18,7 @@ import (
 	xsplithttp "github.com/xtls/xray-core/transport/internet/splithttp"
 
 	"github.com/justinwoo280/sing-xhttp/xhttp"
-	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
@@ -50,7 +50,7 @@ func main() {
 	must(err)
 	port := ln.Addr().(*net.TCPAddr).Port
 
-	logger := log.NewNOPFactory().NewLogger("server")
+	logger := logger.NOP()
 	opts := xhttp.Options{
 		Mode: *mode,
 		Path: "/xhttp",

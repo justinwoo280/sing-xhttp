@@ -25,8 +25,8 @@ import (
 	xstat "github.com/xtls/xray-core/transport/internet/stat"
 
 	"github.com/justinwoo280/sing-xhttp/xhttp"
-	sboxTLS "github.com/sagernet/sing-box/common/tls"
-	"github.com/sagernet/sing-box/log"
+	aTLS "github.com/sagernet/sing/common/tls"
+	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 )
 
@@ -80,7 +80,7 @@ func main() {
 	time.Sleep(100 * time.Millisecond)
 
 	// --- Client: sing-xhttp ---
-	logger := log.NewNOPFactory().NewLogger("client")
+	logger := logger.NOP()
 	opts := xhttp.Options{
 		Mode: *mode,
 		Path: "/xhttp",
@@ -95,7 +95,7 @@ func main() {
 	}
 	// stream-up requires TLS in our impl. The wire test below covers packet-up
 	// (which works on plaintext H1/H2) against Xray's plaintext listener.
-	var tlsCfg sboxTLS.Config = nil
+	var tlsCfg aTLS.Config = nil
 	if *mode == "stream-up" {
 		fmt.Fprintln(os.Stderr, "NOTE: stream-up against Xray needs TLS; sing-xhttp's H1 stream-up is unsupported by design.")
 		fmt.Fprintln(os.Stderr, "      Falling back to packet-up for interop demo against Xray's plaintext listener.")

@@ -12,10 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/common/tls"
-	C "github.com/sagernet/sing-box/constant"
-	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
@@ -28,13 +24,13 @@ import (
 	"golang.org/x/net/http2/h2c"
 )
 
-var _ adapter.V2RayServerTransport = (*Server)(nil)
+var _ ServerTransport = (*Server)(nil)
 
 type Server struct {
 	ctx        context.Context
 	logger     logger.ContextLogger
-	tlsConfig  tls.ServerConfig
-	handler    adapter.V2RayServerTransportHandler
+	tlsConfig  aTLS.ServerConfig
+	handler    ServerHandler
 	httpServer *http.Server
 	h2Server   *http2.Server
 	h2cHandler http.Handler
@@ -83,7 +79,11 @@ func (s *httpSession) markConnected() {
 	s.connectedOnce.Do(func() { close(s.connected) })
 }
 
-func NewServer(ctx context.Context, logger logger.ContextLogger, options Options, tlsConfig tls.ServerConfig, handler adapter.V2RayServerTransportHandler) (*Server, error) {
+// tcpReadHeaderTimeout matches sing-box constant.TCPTimeout. Inlined so this
+// library has no sing-box dependency.
+const tcpReadHeaderTimeout = 15 * time.Second
+
+func NewServer(ctx context.Context, logger logger.ContextLogger, options Options, tlsConfig aTLS.ServerConfig, handler ServerHandler) (*Server, error) {
 	if options.Mode == "" {
 		options.Mode = ModePacketUp
 	}
@@ -109,16 +109,26 @@ func NewServer(ctx context.Context, logger logger.ContextLogger, options Options
 	}
 	s.httpServer = &http.Server{
 		Handler:           s,
-		ReadHeaderTimeout: C.TCPTimeout,
+		ReadHeaderTimeout: tcpReadHeaderTimeout,
 		MaxHeaderBytes:    http.DefaultMaxHeaderBytes,
 		BaseContext: func(net.Listener) context.Context { return ctx },
 		ConnContext: func(ctx context.Context, _ net.Conn) context.Context {
-			return log.ContextWithNewID(ctx)
+			return contextWithNewConnID(ctx)
 		},
 	}
 	s.h2cHandler = h2c.NewHandler(s, s.h2Server)
 	return s, nil
 }
+
+// contextWithNewConnID attaches a fresh per-connection ID. Replaces
+// sing-box's log.ContextWithNewID so this library has no sing-box dep.
+// Embedding apps that want to bridge their own trace IDs can wrap this
+// context themselves.
+func contextWithNewConnID(ctx context.Context) context.Context {
+	return context.WithValue(ctx, connIDKey{}, randomSeed())
+}
+
+type connIDKey struct{}
 
 func intOr(v int32, d int) int {
 	if v <= 0 {

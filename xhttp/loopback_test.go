@@ -12,17 +12,17 @@ import (
 
 	"github.com/justinwoo280/sing-xhttp/xhttp"
 
-	sboxTLS "github.com/sagernet/sing-box/common/tls"
-	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing/common/logger"
+	aTLS "github.com/sagernet/sing/common/tls"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
 
-func anyServerTLS(s *serverTLS) sboxTLS.ServerConfig {
+func anyServerTLS(s *serverTLS) aTLS.ServerConfig {
 	if s == nil { return nil }
 	return s
 }
-func anyClientTLS(c *clientTLS) sboxTLS.Config {
+func anyClientTLS(c *clientTLS) aTLS.Config {
 	if c == nil { return nil }
 	return c
 }
@@ -62,8 +62,7 @@ func runEchoWithOpts(t *testing.T, mode string, useTLS bool, customize func(*xht
 	defer listener.Close()
 	port := listener.Addr().(*net.TCPAddr).Port
 
-	logf := log.NewNOPFactory()
-	logger := logf.NewLogger("test")
+	logger := logger.NOP()
 	ctx := context.Background()
 
 	opts := xhttp.Options{
@@ -211,7 +210,7 @@ func TestXmuxParallelSessions(t *testing.T) {
 	defer listener.Close()
 	port := listener.Addr().(*net.TCPAddr).Port
 
-	logger := log.NewNOPFactory().NewLogger("test")
+	logger := logger.NOP()
 	ctx := context.Background()
 	sTLS, cTLS := makeTLSPair(t)
 
@@ -311,7 +310,7 @@ func TestXmuxSpreadsConnections(t *testing.T) {
 	defer listener.Close()
 	port := listener.Addr().(*net.TCPAddr).Port
 
-	logger := log.NewNOPFactory().NewLogger("test")
+	logger := logger.NOP()
 	ctx := context.Background()
 	sTLS, cTLS := makeTLSPair(t)
 

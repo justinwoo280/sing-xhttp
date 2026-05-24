@@ -12,17 +12,16 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/common/tls"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	aTLS "github.com/sagernet/sing/common/tls"
 
 	"github.com/gofrs/uuid/v5"
 	"golang.org/x/net/http2"
 )
 
-var _ adapter.V2RayClientTransport = (*Client)(nil)
+var _ ClientTransport = (*Client)(nil)
 
 type Client struct {
 	ctx        context.Context
@@ -43,7 +42,7 @@ type Client struct {
 	maxBufferedPost int
 }
 
-func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, options Options, tlsConfig tls.Config) (*Client, error) {
+func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, options Options, tlsConfig aTLS.Config) (*Client, error) {
 	newTransport := buildTransportFactory(dialer, tlsConfig)
 
 	mode := options.Mode
@@ -123,7 +122,7 @@ func (c *Client) Close() error {
 // buildTransportFactory returns a function that creates a fresh http.RoundTripper
 // per pooled xmuxConn. Plaintext gets a stock http.Transport; TLS gets an
 // http2.Transport.
-func buildTransportFactory(dialer N.Dialer, tlsConfig tls.Config) func() http.RoundTripper {
+func buildTransportFactory(dialer N.Dialer, tlsConfig aTLS.Config) func() http.RoundTripper {
 	if tlsConfig == nil {
 		return func() http.RoundTripper {
 			return &http.Transport{
@@ -137,11 +136,19 @@ func buildTransportFactory(dialer N.Dialer, tlsConfig tls.Config) func() http.Ro
 	if len(tlsConfig.NextProtos()) == 0 {
 		tlsConfig.SetNextProtos([]string{http2.NextProtoTLS})
 	}
-	tlsDialer := tls.NewDialer(dialer, tlsConfig)
 	return func() http.RoundTripper {
 		return &http2.Transport{
-			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.STDConfig) (net.Conn, error) {
-				return tlsDialer.DialTLSContext(ctx, M.ParseSocksaddr(addr))
+			DialTLSContext: func(ctx context.Context, network, addr string, cfg *aTLS.STDConfig) (net.Conn, error) {
+				raw, err := dialer.DialContext(ctx, network, M.ParseSocksaddr(addr))
+				if err != nil {
+					return nil, err
+				}
+				tlsConn, err := aTLS.ClientHandshake(ctx, raw, tlsConfig)
+				if err != nil {
+					raw.Close()
+					return nil, err
+				}
+				return tlsConn, nil
 			},
 			ReadIdleTimeout: 0,
 		}

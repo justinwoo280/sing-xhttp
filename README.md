@@ -33,11 +33,29 @@ Defaults match Xray's defaults:
 This means a sing-box client built with `sing-xhttp` should talk to a
 stock Xray server (`xhttp` transport, default config) and vice versa.
 
+## Dependencies
+
+The library has **no sing-box dependency**. Direct imports:
+
+- `github.com/sagernet/sing` — interfaces and utilities (network, metadata, tls, logger)
+- `golang.org/x/net` — http2 / h2c / hpack
+- `github.com/gofrs/uuid/v5` — session id
+
+The `ServerTransport` / `ClientTransport` / `ServerHandler` interfaces in
+`xhttp/adapter.go` are structurally identical to sing-box's
+`adapter.V2RayServerTransport` / `V2RayClientTransport` /
+`V2RayServerTransportHandler` — sing-box's concrete types satisfy them
+automatically. This means sing-box can import sing-xhttp without a
+circular dependency.
+
+The `cmd/` directory (interop binaries against real Xray) is a separate
+Go module so its xray-core dependency does not leak into library consumers.
+
 ## Build into sing-box
 
-This library can't be plugged into vanilla sing-box because
-`transport/v2ray/transport.go` is a hard-coded switch. We provide a small
-patch that adds an external registration hook.
+Vanilla sing-box doesn't know about "xhttp" — `transport/v2ray/transport.go`
+is a hard-coded switch. We provide a small patch that adds an external
+registration hook.
 
 1. Apply `patches/0001-sing-box-register-xhttp-transport.patch` to your
    sing-box checkout.
