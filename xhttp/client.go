@@ -28,7 +28,7 @@ type Client struct {
 	ctx        context.Context
 	dialer     N.Dialer
 	serverAddr M.Socksaddr
-	transport  http.RoundTripper
+	xmux       *xmuxManager
 	http2      bool
 	requestURL url.URL
 	host       string
@@ -44,30 +44,7 @@ type Client struct {
 }
 
 func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, options Options, tlsConfig tls.Config) (*Client, error) {
-	var transport http.RoundTripper
-	if tlsConfig == nil {
-		// Plain HTTP/1.1. POSTs and GET share the same http.Transport which pools
-		// idle keep-alive connections, but GET on its own conn will keep one
-		// occupied for the whole session — that's fine.
-		transport = &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return dialer.DialContext(ctx, network, M.ParseSocksaddr(addr))
-			},
-			ForceAttemptHTTP2: false,
-		}
-	} else {
-		if len(tlsConfig.NextProtos()) == 0 {
-			tlsConfig.SetNextProtos([]string{http2.NextProtoTLS})
-		}
-		tlsDialer := tls.NewDialer(dialer, tlsConfig)
-		transport = &http2.Transport{
-			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.STDConfig) (net.Conn, error) {
-				return tlsDialer.DialTLSContext(ctx, M.ParseSocksaddr(addr))
-			},
-			// Generous so the long-lived GET stream doesn't get reaped.
-			ReadIdleTimeout: 0,
-		}
-	}
+	newTransport := buildTransportFactory(dialer, tlsConfig)
 
 	mode := options.Mode
 	switch mode {
@@ -110,11 +87,19 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 		host = serverAddr.AddrString()
 	}
 
+	var xmuxCfg XmuxConfig
+	if options.Xmux != nil {
+		xmuxCfg = *options.Xmux
+	}
+	mgr := newXmuxManager(xmuxCfg, func() *xmuxConn {
+		return &xmuxConn{transport: newTransport()}
+	})
+
 	return &Client{
 		ctx:             ctx,
 		dialer:          dialer,
 		serverAddr:      serverAddr,
-		transport:       transport,
+		xmux:            mgr,
 		http2:           tlsConfig != nil,
 		requestURL:      requestURL,
 		host:            host,
@@ -128,17 +113,54 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	}, nil
 }
 
-func (c *Client) Close() error { return nil }
+func (c *Client) Close() error {
+	if c.xmux != nil {
+		c.xmux.Close()
+	}
+	return nil
+}
+
+// buildTransportFactory returns a function that creates a fresh http.RoundTripper
+// per pooled xmuxConn. Plaintext gets a stock http.Transport; TLS gets an
+// http2.Transport.
+func buildTransportFactory(dialer N.Dialer, tlsConfig tls.Config) func() http.RoundTripper {
+	if tlsConfig == nil {
+		return func() http.RoundTripper {
+			return &http.Transport{
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					return dialer.DialContext(ctx, network, M.ParseSocksaddr(addr))
+				},
+				ForceAttemptHTTP2: false,
+			}
+		}
+	}
+	if len(tlsConfig.NextProtos()) == 0 {
+		tlsConfig.SetNextProtos([]string{http2.NextProtoTLS})
+	}
+	tlsDialer := tls.NewDialer(dialer, tlsConfig)
+	return func() http.RoundTripper {
+		return &http2.Transport{
+			DialTLSContext: func(ctx context.Context, network, addr string, cfg *tls.STDConfig) (net.Conn, error) {
+				return tlsDialer.DialTLSContext(ctx, M.ParseSocksaddr(addr))
+			},
+			ReadIdleTimeout: 0,
+		}
+	}
+}
 
 func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {
 	sidUUID, _ := uuid.NewV4()
 	sessionID := sidUUID.String()
 
+	xc := c.xmux.Pick()
+	xc.openUsage.Add(1)
+	xc.leftRequests.Add(-1)
+
 	switch c.opts.Mode {
 	case ModeStreamUp:
-		return c.dialStreamUp(ctx, sessionID)
+		return c.dialStreamUp(ctx, sessionID, xc)
 	default:
-		return c.dialPacketUp(ctx, sessionID)
+		return c.dialPacketUp(ctx, sessionID, xc)
 	}
 }
 
@@ -169,12 +191,12 @@ func (c *Client) newRequest(ctx context.Context, method, sessionID, seqStr strin
 
 // openDownload opens the long-lived GET that carries the downlink. The
 // returned ReadCloser is the response body and lives for the session.
-func (c *Client) openDownload(ctx context.Context, sessionID string) (io.ReadCloser, net.Addr, net.Addr, error) {
+func (c *Client) openDownload(ctx context.Context, sessionID string, xc *xmuxClient) (io.ReadCloser, net.Addr, net.Addr, error) {
 	req, err := c.newRequest(ctx, http.MethodGet, sessionID, "", nil)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	resp, err := c.transport.RoundTrip(req)
+	resp, err := xc.conn.transport.RoundTrip(req)
 	if err != nil {
 		return nil, nil, nil, E.Cause(err, "xhttp: open download")
 	}
@@ -187,9 +209,10 @@ func (c *Client) openDownload(ctx context.Context, sessionID string) (io.ReadClo
 
 // --- stream-up ---
 
-func (c *Client) dialStreamUp(ctx context.Context, sessionID string) (net.Conn, error) {
-	downBody, remote, local, err := c.openDownload(ctx, sessionID)
+func (c *Client) dialStreamUp(ctx context.Context, sessionID string, xc *xmuxClient) (net.Conn, error) {
+	downBody, remote, local, err := c.openDownload(ctx, sessionID, xc)
 	if err != nil {
+		xc.openUsage.Add(-1)
 		return nil, err
 	}
 
@@ -208,12 +231,13 @@ func (c *Client) dialStreamUp(ctx context.Context, sessionID string) (net.Conn, 
 		if doneOnce.Swap(true) {
 			return nil
 		}
+		xc.openUsage.Add(-1)
 		_ = pw.Close()
 		return downBody.Close()
 	}
 
 	go func() {
-		resp, err := c.transport.RoundTrip(upReq)
+		resp, err := xc.conn.transport.RoundTrip(upReq)
 		if err != nil {
 			_ = pw.CloseWithError(err)
 			_ = downBody.Close()
@@ -238,9 +262,10 @@ func (c *Client) dialStreamUp(ctx context.Context, sessionID string) (net.Conn, 
 
 // --- packet-up ---
 
-func (c *Client) dialPacketUp(ctx context.Context, sessionID string) (net.Conn, error) {
-	downBody, remote, local, err := c.openDownload(ctx, sessionID)
+func (c *Client) dialPacketUp(ctx context.Context, sessionID string, xc *xmuxClient) (net.Conn, error) {
+	downBody, remote, local, err := c.openDownload(ctx, sessionID, xc)
 	if err != nil {
+		xc.openUsage.Add(-1)
 		return nil, err
 	}
 
@@ -252,13 +277,18 @@ func (c *Client) dialPacketUp(ctx context.Context, sessionID string) (net.Conn, 
 	}
 
 	uctx, cancel := context.WithCancel(ctx)
+	closeOnce := atomic.Bool{}
 	closeAll := func() error {
+		if closeOnce.Swap(true) {
+			return nil
+		}
 		cancel()
+		xc.openUsage.Add(-1)
 		_ = pw.Close()
 		return downBody.Close()
 	}
 
-	go c.runPacketUploader(uctx, sessionID, pr, maxEach, downBody, pw)
+	go c.runPacketUploader(uctx, sessionID, pr, maxEach, downBody, pw, xc)
 
 	return &splitConn{
 		reader:  downBody,
@@ -269,7 +299,7 @@ func (c *Client) dialPacketUp(ctx context.Context, sessionID string) (net.Conn, 
 	}, nil
 }
 
-func (c *Client) runPacketUploader(ctx context.Context, sessionID string, pr *io.PipeReader, maxEach int, downBody io.Closer, pw *io.PipeWriter) {
+func (c *Client) runPacketUploader(ctx context.Context, sessionID string, pr *io.PipeReader, maxEach int, downBody io.Closer, pw *io.PipeWriter, xc *xmuxClient) {
 	var seq uint64
 	var lastWrite time.Time
 
@@ -295,7 +325,7 @@ func (c *Client) runPacketUploader(ctx context.Context, sessionID string, pr *io
 			seqStr := strconv.FormatUint(seq, 10)
 			seq++
 
-			if postErr := c.sendOnePost(ctx, sessionID, seqStr, chunk); postErr != nil {
+			if postErr := c.sendOnePost(ctx, sessionID, seqStr, chunk, xc); postErr != nil {
 				_ = pw.CloseWithError(postErr)
 				_ = downBody.Close()
 				return
@@ -307,13 +337,13 @@ func (c *Client) runPacketUploader(ctx context.Context, sessionID string, pr *io
 	}
 }
 
-func (c *Client) sendOnePost(ctx context.Context, sessionID, seqStr string, payload []byte) error {
+func (c *Client) sendOnePost(ctx context.Context, sessionID, seqStr string, payload []byte, xc *xmuxClient) error {
 	req, err := c.newRequest(ctx, c.method, sessionID, seqStr, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
 	req.ContentLength = int64(len(payload))
-	resp, err := c.transport.RoundTrip(req)
+	resp, err := xc.conn.transport.RoundTrip(req)
 	if err != nil {
 		return E.Cause(err, "xhttp: post packet")
 	}

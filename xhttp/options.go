@@ -66,6 +66,22 @@ type Options struct {
 	SessionKey       string `json:"session_key,omitempty"`       // header/cookie/query name; default per placement
 	SeqPlacement     string `json:"seq_placement,omitempty"`     // path | query | header | cookie
 	SeqKey           string `json:"seq_key,omitempty"`           // header/cookie/query name; default per placement
+
+	// XMUX: pool of independent HTTP transports (each one its own TCP+TLS session).
+	// Improves throughput by spreading streams across multiple H2 connections — a
+	// single H2 connection is capped by the server's MAX_CONCURRENT_STREAMS (commonly
+	// 100 on CDNs) — and rotates connections by time/request count to dodge per-conn
+	// limits. When nil, a single connection is used (legacy behavior).
+	Xmux *XmuxConfig `json:"xmux,omitempty"`
+}
+
+// XmuxConfig mirrors Xray's XmuxConfig. All zero == unlimited.
+type XmuxConfig struct {
+	MaxConcurrency   *Range `json:"max_concurrency,omitempty"`     // max in-flight sessions per connection; 0 = unlimited
+	MaxConnections   *Range `json:"max_connections,omitempty"`     // max simultaneous connections; 0 = unlimited
+	CMaxReuseTimes   *Range `json:"c_max_reuse_times,omitempty"`   // max times a connection is picked; 0 = unlimited
+	HMaxRequestTimes *Range `json:"h_max_request_times,omitempty"` // max sessions served per connection; 0 = unlimited
+	HMaxReusableSecs *Range `json:"h_max_reusable_secs,omitempty"` // wall-clock lifetime of a connection in seconds; 0 = unlimited
 }
 
 func (r *Range) orDefault(from, to int32) Range {

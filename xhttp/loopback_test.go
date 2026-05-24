@@ -189,3 +189,212 @@ func TestPlacementStreamUpHeader(t *testing.T) {
 		o.SessionPlacement = xhttp.PlacementHeader
 	})
 }
+
+// --- XMUX coverage ------------------------------------------------------
+
+func TestXmuxBasic(t *testing.T) {
+	// Two-conn pool with concurrency=1 -> two sessions must land on two conns.
+	runEchoWithOpts(t, xhttp.ModePacketUp, true, func(o *xhttp.Options) {
+		o.Xmux = &xhttp.XmuxConfig{
+			MaxConnections: &xhttp.Range{From: 2, To: 2},
+			MaxConcurrency: &xhttp.Range{From: 1, To: 1},
+		}
+	})
+}
+
+func TestXmuxParallelSessions(t *testing.T) {
+	// Spin up many concurrent sessions and confirm each completes.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	port := listener.Addr().(*net.TCPAddr).Port
+
+	logger := log.NewNOPFactory().NewLogger("test")
+	ctx := context.Background()
+	sTLS, cTLS := makeTLSPair(t)
+
+	opts := xhttp.Options{
+		Mode: xhttp.ModePacketUp,
+		Path: "/xhttp",
+		ScMaxEachPostBytes: &xhttp.Range{From: 4096, To: 4096},
+		Xmux: &xhttp.XmuxConfig{
+			MaxConnections:   &xhttp.Range{From: 4, To: 4},
+			MaxConcurrency:   &xhttp.Range{From: 2, To: 2},
+			HMaxRequestTimes: &xhttp.Range{From: 3, To: 3}, // forces rotation
+		},
+	}
+
+	server, err := xhttp.NewServer(ctx, logger, opts, anyServerTLS(sTLS), echoHandler{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	go server.Serve(listener)
+	time.Sleep(50 * time.Millisecond)
+
+	client, err := xhttp.NewClient(ctx, directDialer{}, M.ParseSocksaddrHostPort("127.0.0.1", uint16(port)), opts, anyClientTLS(cTLS))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	const N = 12
+	var wg sync.WaitGroup
+	errs := make(chan error, N)
+	for i := 0; i < N; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			conn, err := client.DialContext(ctx)
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer conn.Close()
+			payload := make([]byte, 8192)
+			rand.Read(payload)
+			recv := make([]byte, len(payload))
+			done := make(chan error, 2)
+			go func() { _, e := io.ReadFull(conn, recv); done <- e }()
+			go func() { _, e := io.Copy(conn, bytes.NewReader(payload)); done <- e }()
+			for k := 0; k < 2; k++ {
+				select {
+				case e := <-done:
+					if e != nil {
+						errs <- e
+						return
+					}
+				case <-time.After(8 * time.Second):
+					errs <- net.ErrClosed
+					return
+				}
+			}
+			if !bytes.Equal(payload, recv) {
+				errs <- net.ErrClosed
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for e := range errs {
+		t.Fatalf("session error: %v", e)
+	}
+}
+
+func TestXmuxConnRotation(t *testing.T) {
+	// HMaxRequestTimes=1 -> every session gets a fresh conn.
+	runEchoWithOpts(t, xhttp.ModePacketUp, true, func(o *xhttp.Options) {
+		o.Xmux = &xhttp.XmuxConfig{
+			HMaxRequestTimes: &xhttp.Range{From: 1, To: 1},
+		}
+	})
+}
+
+func TestXmuxReusableSecs(t *testing.T) {
+	// HMaxReusableSecs=1 -> first session ok; later sessions get fresh conn.
+	runEchoWithOpts(t, xhttp.ModePacketUp, true, func(o *xhttp.Options) {
+		o.Xmux = &xhttp.XmuxConfig{
+			HMaxReusableSecs: &xhttp.Range{From: 1, To: 1},
+		}
+	})
+}
+
+// TestXmuxSpreadsConnections verifies that with MaxConnections=N and concurrency=1,
+// N concurrent sessions actually originate from N distinct TCP source ports.
+func TestXmuxSpreadsConnections(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	port := listener.Addr().(*net.TCPAddr).Port
+
+	logger := log.NewNOPFactory().NewLogger("test")
+	ctx := context.Background()
+	sTLS, cTLS := makeTLSPair(t)
+
+	var mu sync.Mutex
+	seen := map[string]struct{}{}
+	hold := make(chan struct{})
+
+	handler := holdHandler{seen: seen, mu: &mu, hold: hold}
+	opts := xhttp.Options{
+		Mode: xhttp.ModePacketUp,
+		Path: "/xhttp",
+		Xmux: &xhttp.XmuxConfig{
+			MaxConnections: &xhttp.Range{From: 4, To: 4},
+			MaxConcurrency: &xhttp.Range{From: 1, To: 1},
+		},
+	}
+	server, err := xhttp.NewServer(ctx, logger, opts, anyServerTLS(sTLS), handler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	go server.Serve(listener)
+	time.Sleep(50 * time.Millisecond)
+
+	client, err := xhttp.NewClient(ctx, directDialer{}, M.ParseSocksaddrHostPort("127.0.0.1", uint16(port)), opts, anyClientTLS(cTLS))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	conns := make([]net.Conn, 4)
+	for i := 0; i < 4; i++ {
+		c, err := client.DialContext(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conns[i] = c
+		// Drive a byte so the GET round-trip lands on the wire and the
+		// server records the source port.
+		_, _ = c.Write([]byte{'x'})
+	}
+	// Wait for server to see all sessions.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		mu.Lock()
+		n := len(seen)
+		mu.Unlock()
+		if n >= 4 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	close(hold)
+	for _, c := range conns {
+		c.Close()
+	}
+
+	mu.Lock()
+	count := len(seen)
+	mu.Unlock()
+	if count < 4 {
+		t.Fatalf("expected 4 distinct source ports, got %d: %v", count, seen)
+	}
+}
+
+type holdHandler struct {
+	seen map[string]struct{}
+	mu   *sync.Mutex
+	hold chan struct{}
+}
+
+func (h holdHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, _ M.Socksaddr, onClose N.CloseHandlerFunc) {
+	go func() {
+		defer conn.Close()
+		h.mu.Lock()
+		h.seen[source.String()] = struct{}{}
+		h.mu.Unlock()
+		// Drain a byte so the read pump starts.
+		b := make([]byte, 1)
+		_, _ = conn.Read(b)
+		<-h.hold
+		if onClose != nil {
+			onClose(nil)
+		}
+	}()
+}

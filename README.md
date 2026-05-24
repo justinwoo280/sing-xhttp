@@ -98,6 +98,34 @@ Note that the `tokenish` method generates base62 strings whose HPACK
 Huffman-encoded byte length targets `x_padding_bytes` (i.e. the *wire*
 length after HPACK compression matches the configured range).
 
+### XMUX (multiple H2 connections)
+
+A single HTTP/2 connection is capped by the server's `MAX_CONCURRENT_STREAMS`
+(commonly 100 on CDNs). XMUX spreads sessions over a pool of independent
+connections and rotates them on time / request-count limits to dodge
+per-connection caps. Each pool entry is its own TCP+TLS session.
+
+When `xmux` is absent or empty, the client uses a single connection (legacy
+behavior, indistinguishable from earlier versions on the wire).
+
+```jsonc
+"transport": {
+  "type": "xhttp",
+  "path": "/xhttp",
+  "xmux": {
+    "max_concurrency":     { "from": 16,  "to": 16  }, // in-flight sessions per conn; 0 = unlimited
+    "max_connections":     { "from": 4,   "to": 4   }, // simultaneous conns; 0 = unlimited
+    "c_max_reuse_times":   { "from": 64,  "to": 128 }, // how many times a conn is picked before retiring
+    "h_max_request_times": { "from": 600, "to": 900 }, // sessions served per conn before retiring
+    "h_max_reusable_secs": { "from": 1800,"to": 3600 } // wall-clock lifetime per conn (seconds)
+  }
+}
+```
+
+The XMUX field names mirror Xray's so the same config block works on both
+sides. Setting `max_connections > 0` with `max_concurrency=0` simply spreads
+sessions over up to N conns without per-conn caps.
+
 ## Tuning
 
 - `sc_max_each_post_bytes` (default 1 MB) caps the size of each uplink
@@ -114,7 +142,6 @@ length after HPACK compression matches the configured range).
 
 ## TODO
 
-- [ ] XMUX (multiple H2 connections, request-count limits)
 - [ ] stream-up reverse heartbeat tuning (currently a literal port)
 - [ ] HTTP/1.1 raw-socket path for stream-up (only if there's demand)
 - [ ] uplink-data placement (header / cookie carrying payload) — niche,
