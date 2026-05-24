@@ -33,6 +33,13 @@ import (
 func main() {
 	mode := flag.String("mode", "packet-up", "packet-up|stream-up")
 	size := flag.Int("size", 64*1024, "bytes to echo")
+	sessionPlace := flag.String("session-placement", "", "path|query|header|cookie (xray + sing-xhttp must match)")
+	seqPlace := flag.String("seq-placement", "", "path|query|header|cookie")
+	xpadObfs := flag.Bool("x-padding-obfs", false, "enable XPaddingObfsMode")
+	xpadPlace := flag.String("x-padding-placement", "", "query|header|cookie (when obfs)")
+	xpadMethod := flag.String("x-padding-method", "", "repeat-x|tokenish (when obfs)")
+	xpadKey := flag.String("x-padding-key", "", "cookie/query key (when obfs)")
+	xpadHeader := flag.String("x-padding-header", "", "header name (when obfs)")
 	flag.Parse()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -44,6 +51,13 @@ func main() {
 	xrayCfg := &xsplithttp.Config{
 		Path: "/xhttp",
 		Mode: *mode,
+		SessionPlacement: *sessionPlace,
+		SeqPlacement:     *seqPlace,
+		XPaddingObfsMode: *xpadObfs,
+		XPaddingPlacement: *xpadPlace,
+		XPaddingMethod:    *xpadMethod,
+		XPaddingKey:       *xpadKey,
+		XPaddingHeader:    *xpadHeader,
 	}
 	memCfg := &xinternet.MemoryStreamConfig{
 		ProtocolName:     "splithttp",
@@ -71,6 +85,13 @@ func main() {
 		Mode: *mode,
 		Path: "/xhttp",
 		ScMaxEachPostBytes: &xhttp.Range{From: 8192, To: 8192},
+		SessionPlacement: *sessionPlace,
+		SeqPlacement:     *seqPlace,
+		XPaddingObfsMode: *xpadObfs,
+		XPaddingPlacement: *xpadPlace,
+		XPaddingMethod:    *xpadMethod,
+		XPaddingKey:       *xpadKey,
+		XPaddingHeader:    *xpadHeader,
 	}
 	// stream-up requires TLS in our impl. The wire test below covers packet-up
 	// (which works on plaintext H1/H2) against Xray's plaintext listener.

@@ -45,7 +45,7 @@ type Server struct {
 	headers    http.Header
 	opts       Options
 
-	paddingBytes       Range
+	codec              *codec
 	maxEachPostBytes   Range
 	maxBufferedPosts   int
 	streamUpServerSecs Range
@@ -101,7 +101,7 @@ func NewServer(ctx context.Context, logger logger.ContextLogger, options Options
 		method:             options.Method,
 		headers:            options.Headers.Build(),
 		opts:               options,
-		paddingBytes:       options.XPaddingBytes.orDefault(100, 1000),
+		codec:              newCodec(options),
 		maxEachPostBytes:   options.ScMaxEachPostBytes.orDefault(1_000_000, 1_000_000),
 		maxBufferedPosts:   intOr(options.ScMaxBufferedPosts, 30),
 		streamUpServerSecs: options.ScStreamUpServerSecs.orDefault(20, 80),
@@ -194,7 +194,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.invalid(w, r, http.StatusNotFound, E.New("bad host: ", r.Host))
 		return
 	}
-	if !strings.HasPrefix(r.URL.Path, s.path) {
+	if !strings.HasPrefix(r.URL.Path, s.codec.basePath) {
 		s.invalid(w, r, http.StatusNotFound, E.New("bad path: ", r.URL.Path))
 		return
 	}
@@ -209,7 +209,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set(k, v)
 		}
 	}
-	applyPaddingViaHeader(w.Header(), int(rangeRand(s.paddingBytes)))
+	s.codec.applyPaddingToResponseHeader(w)
 
 	if r.Method == http.MethodOptions {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -219,7 +219,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sessionID, seqStr, ok := extractMeta(r.URL.Path, s.path)
+	sessionID, seqStr, ok := s.codec.extractMetaFromRequest(r)
 	if !ok {
 		s.invalid(w, r, http.StatusNotFound, E.New("path doesn't match base"))
 		return
@@ -308,7 +308,7 @@ func (s *Server) handleStreamUpPost(w http.ResponseWriter, r *http.Request, sess
 			case <-done:
 				return
 			case <-tk.C:
-				if _, err := w.Write(bytes.Repeat([]byte{'X'}, int(rangeRand(s.paddingBytes)))); err != nil {
+				if _, err := w.Write(bytes.Repeat([]byte{'X'}, int(rangeRand(s.codec.xpadRange)))); err != nil {
 					return
 				}
 				if fl, ok := w.(http.Flusher); ok {

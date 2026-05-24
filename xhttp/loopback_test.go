@@ -51,6 +51,10 @@ func (directDialer) ListenPacket(ctx context.Context, dest M.Socksaddr) (net.Pac
 }
 
 func runEcho(t *testing.T, mode string, useTLS bool) {
+	runEchoWithOpts(t, mode, useTLS, nil)
+}
+
+func runEchoWithOpts(t *testing.T, mode string, useTLS bool, customize func(*xhttp.Options)) {
 	t.Helper()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -66,6 +70,9 @@ func runEcho(t *testing.T, mode string, useTLS bool) {
 		Mode: mode,
 		Path: "/xhttp",
 		ScMaxEachPostBytes: &xhttp.Range{From: 4096, To: 4096}, // small to exercise splitting
+	}
+	if customize != nil {
+		customize(&opts)
 	}
 
 	var (
@@ -130,3 +137,55 @@ func runEcho(t *testing.T, mode string, useTLS bool) {
 func TestEchoPacketUpPlain(t *testing.T) { runEcho(t, xhttp.ModePacketUp, false) }
 func TestEchoPacketUpTLS(t *testing.T)   { runEcho(t, xhttp.ModePacketUp, true) }
 func TestEchoStreamUpTLS(t *testing.T)   { runEcho(t, xhttp.ModeStreamUp, true) }
+
+// --- placement / padding-method coverage --------------------------------
+
+func TestPlacementHeader(t *testing.T) {
+	runEchoWithOpts(t, xhttp.ModePacketUp, true, func(o *xhttp.Options) {
+		o.SessionPlacement = xhttp.PlacementHeader
+		o.SeqPlacement = xhttp.PlacementHeader
+	})
+}
+
+func TestPlacementQuery(t *testing.T) {
+	runEchoWithOpts(t, xhttp.ModePacketUp, true, func(o *xhttp.Options) {
+		o.SessionPlacement = xhttp.PlacementQuery
+		o.SeqPlacement = xhttp.PlacementQuery
+	})
+}
+
+func TestPlacementCookie(t *testing.T) {
+	runEchoWithOpts(t, xhttp.ModePacketUp, true, func(o *xhttp.Options) {
+		o.SessionPlacement = xhttp.PlacementCookie
+		o.SeqPlacement = xhttp.PlacementCookie
+	})
+}
+
+func TestPlacementMixed(t *testing.T) {
+	// session in header, seq still on path (a realistic obfuscation choice)
+	runEchoWithOpts(t, xhttp.ModePacketUp, true, func(o *xhttp.Options) {
+		o.SessionPlacement = xhttp.PlacementHeader
+		o.SessionKey = "X-Sid"
+	})
+}
+
+func TestPaddingObfsHeaderTokenish(t *testing.T) {
+	runEchoWithOpts(t, xhttp.ModePacketUp, true, func(o *xhttp.Options) {
+		o.XPaddingObfsMode = true
+		o.XPaddingPlacement = xhttp.PlacementHeader
+		o.XPaddingMethod = xhttp.PaddingMethodTokenish
+	})
+}
+
+func TestPaddingObfsCookie(t *testing.T) {
+	runEchoWithOpts(t, xhttp.ModePacketUp, true, func(o *xhttp.Options) {
+		o.XPaddingObfsMode = true
+		o.XPaddingPlacement = xhttp.PlacementCookie
+	})
+}
+
+func TestPlacementStreamUpHeader(t *testing.T) {
+	runEchoWithOpts(t, xhttp.ModeStreamUp, true, func(o *xhttp.Options) {
+		o.SessionPlacement = xhttp.PlacementHeader
+	})
+}

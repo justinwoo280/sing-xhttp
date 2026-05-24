@@ -70,11 +70,52 @@ Client/server outbound + inbound JSON snippet:
 }
 ```
 
+### Placement / padding obfuscation
+
+Both sides must agree on placement choices. Defaults match stock Xray
+(everything on the path, padding via `Referer?x_padding=...`).
+
+```jsonc
+"transport": {
+  "type": "xhttp",
+  "path": "/xhttp",
+  // session and seq in headers instead of URL path:
+  "session_placement": "header",  // path | query | header | cookie
+  "session_key":       "X-Sid",   // defaults: "X-Session" / "x_session"
+  "seq_placement":     "header",
+  "seq_key":           "X-Sq",
+
+  // padding obfuscation (when off, Referer/x_padding is used — Xray default):
+  "x_padding_obfs_mode":  true,
+  "x_padding_placement": "header",     // query | header | cookie
+  "x_padding_header":    "X-Padding",  // for header placement
+  "x_padding_key":       "x_padding",  // for query/cookie placement
+  "x_padding_method":    "tokenish"    // repeat-x (default) | tokenish
+}
+```
+
+Note that the `tokenish` method generates base62 strings whose HPACK
+Huffman-encoded byte length targets `x_padding_bytes` (i.e. the *wire*
+length after HPACK compression matches the configured range).
+
+## Tuning
+
+- `sc_max_each_post_bytes` (default 1 MB) caps the size of each uplink
+  POST in `packet-up` mode. Smaller values mean more POSTs per MB.
+- `sc_max_buffered_posts` (default 30) limits how many out-of-order POSTs
+  the server holds before EOF-ing the session. **On H1.1 the connection
+  pool serializes POSTs**, so combinations like `sc_max_each_post_bytes=8192`
+  with a 4 MB write quickly produce 500+ in-flight POSTs and stall on the
+  default `sc_max_buffered_posts=30`. Either raise the buffered-post
+  cap or keep the per-post chunk near 1 MB. H2 multiplexes so the cap
+  matters less in practice.
+- Both client and server must agree on `sc_max_each_post_bytes` — the server
+  rejects oversized POSTs.
+
 ## TODO
 
-- [ ] padding placement modes: query / header / cookie (currently only
-      Referer-with-query, matching Xray default)
-- [ ] `tokenish` padding (HPACK Huffman length-target iteration)
 - [ ] XMUX (multiple H2 connections, request-count limits)
 - [ ] stream-up reverse heartbeat tuning (currently a literal port)
 - [ ] HTTP/1.1 raw-socket path for stream-up (only if there's demand)
+- [ ] uplink-data placement (header / cookie carrying payload) — niche,
+      forces tiny chunk sizes; ask if you actually need it

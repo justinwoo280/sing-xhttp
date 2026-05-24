@@ -37,7 +37,7 @@ type Client struct {
 	opts       Options
 
 	// derived defaults
-	paddingBytes    Range
+	codec           *codec
 	maxEachPost     Range
 	minPostInterval Range
 	maxBufferedPost int
@@ -121,7 +121,7 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 		method:          options.Method,
 		headers:         options.Headers.Build(),
 		opts:            options,
-		paddingBytes:    options.XPaddingBytes.orDefault(100, 1000),
+		codec:           newCodec(options),
 		maxEachPost:     options.ScMaxEachPostBytes.orDefault(1_000_000, 1_000_000),
 		minPostInterval: options.ScMinPostsIntervalMs.orDefault(30, 30),
 		maxBufferedPost: int(options.ScMaxBufferedPosts),
@@ -155,14 +155,15 @@ func (c *Client) cloneHeaders() http.Header {
 // path embeds sessionID (and seq if non-empty).
 func (c *Client) newRequest(ctx context.Context, method, sessionID, seqStr string, body io.Reader) (*http.Request, error) {
 	u := c.requestURL
-	u.Path = buildPath(c.opts.Path, sessionID, seqStr)
+	u.Path = c.codec.basePath
 	req, err := http.NewRequestWithContext(ctx, method, u.String(), body)
 	if err != nil {
 		return nil, err
 	}
 	req.Host = c.host
 	req.Header = c.cloneHeaders()
-	applyPaddingViaReferer(req.Header, &u, int(rangeRand(c.paddingBytes)))
+	c.codec.applyMetaToRequest(req, sessionID, seqStr)
+	c.codec.applyPaddingToRequest(req)
 	return req, nil
 }
 
