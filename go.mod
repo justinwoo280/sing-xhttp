@@ -1,4 +1,4 @@
-module github.com/exedev/sing-xhttp
+module github.com/justinwoo280/sing-xhttp
 
 go 1.26
 

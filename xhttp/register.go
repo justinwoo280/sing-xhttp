@@ -10,7 +10,7 @@ package xhttp
 //
 //   import (
 //     "github.com/sagernet/sing-box/transport/v2ray"
-//     "github.com/exedev/sing-xhttp/xhttp"
+//     "github.com/justinwoo280/sing-xhttp/xhttp"
 //   )
 //   func init() {
 //     v2ray.RegisterXHTTP(xhttp.ServerConstructor, xhttp.ClientConstructor)

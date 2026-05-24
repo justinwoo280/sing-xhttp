@@ -45,9 +45,9 @@ patch that adds an external registration hook.
 
 ```go
 import (
-    _ "github.com/exedev/sing-xhttp/xhttp" // import for side effects
+    _ "github.com/justinwoo280/sing-xhttp/xhttp" // import for side effects
     "github.com/sagernet/sing-box/transport/v2ray"
-    "github.com/exedev/sing-xhttp/xhttp"
+    "github.com/justinwoo280/sing-xhttp/xhttp"
 )
 
 func init() {

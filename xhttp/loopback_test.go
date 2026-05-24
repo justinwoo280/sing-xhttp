@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/exedev/sing-xhttp/xhttp"
+	"github.com/justinwoo280/sing-xhttp/xhttp"
 
 	sboxTLS "github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/log"

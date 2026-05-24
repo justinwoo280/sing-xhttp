@@ -17,7 +17,7 @@ import (
 	xinternet "github.com/xtls/xray-core/transport/internet"
 	xsplithttp "github.com/xtls/xray-core/transport/internet/splithttp"
 
-	"github.com/exedev/sing-xhttp/xhttp"
+	"github.com/justinwoo280/sing-xhttp/xhttp"
 	"github.com/sagernet/sing-box/log"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"

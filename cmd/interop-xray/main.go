@@ -24,7 +24,7 @@ import (
 	xsplithttp "github.com/xtls/xray-core/transport/internet/splithttp"
 	xstat "github.com/xtls/xray-core/transport/internet/stat"
 
-	"github.com/exedev/sing-xhttp/xhttp"
+	"github.com/justinwoo280/sing-xhttp/xhttp"
 	sboxTLS "github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/log"
 	M "github.com/sagernet/sing/common/metadata"
