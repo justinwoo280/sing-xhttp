@@ -1,7 +1,3 @@
 /interop-xray
 /interop-rev
-
-# cmd/ is an interop-test workspace with local replace directives
-# (xray-core etc.). It is not part of the published library.
-/cmd/go.mod
-/cmd/go.sum
+/cmd/
