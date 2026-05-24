@@ -48,30 +48,31 @@ The `ServerTransport` / `ClientTransport` / `ServerHandler` interfaces in
 automatically. This means sing-box can import sing-xhttp without a
 circular dependency.
 
-The `cmd/` directory (interop binaries against real Xray) is a separate
-Go module so its xray-core dependency does not leak into library consumers.
+## Integrating with sing-box
 
-## Build into sing-box
+Vanilla sing-box doesn't know about "xhttp" — its
+`transport/v2ray/transport.go` is a hard-coded switch. To integrate this
+library, your sing-box fork should:
 
-Vanilla sing-box doesn't know about "xhttp" — `transport/v2ray/transport.go`
-is a hard-coded switch. We provide a small patch that adds an external
-registration hook.
+1. Add `V2RayTransportTypeXHTTP = "xhttp"` to `constant/v2ray.go`.
+2. Add a `XHTTPOptions` field plus its JSON marshal/unmarshal cases to
+   `option/V2RayTransportOptions` (declare a `V2RayXHTTPOptions` struct
+   mirroring `xhttp.Options`).
+3. Add `case C.V2RayTransportTypeXHTTP:` branches to both
+   `NewServerTransport` and `NewClientTransport` in
+   `transport/v2ray/transport.go`, dispatching to a small bridge file
+   that calls `xhttp.NewServer` / `xhttp.NewClient` and converts the
+   option struct.
 
-1. Apply `patches/0001-sing-box-register-xhttp-transport.patch` to your
-   sing-box checkout.
-2. In your custom main package:
+A worked example lives in the author's sing-box fork at
+`transport/v2ray/xhttp.go`. The bridge is roughly 80 lines.
 
-```go
-import (
-    _ "github.com/justinwoo280/sing-xhttp/xhttp" // import for side effects
-    "github.com/sagernet/sing-box/transport/v2ray"
-    "github.com/justinwoo280/sing-xhttp/xhttp"
-)
-
-func init() {
-    v2ray.RegisterXHTTP(xhttp.ServerConstructor, xhttp.ClientConstructor)
-}
-```
+Because the `xhttp.ServerTransport` / `xhttp.ClientTransport` /
+`xhttp.ServerHandler` interfaces are structurally identical to
+sing-box's `adapter.V2RayServerTransport` /
+`adapter.V2RayClientTransport` /
+`adapter.V2RayServerTransportHandler`, sing-box's concrete types satisfy
+our interfaces by Go's structural typing — no wrapping required.
 
 ## Config example
 
