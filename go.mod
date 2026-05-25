@@ -4,7 +4,7 @@ go 1.24.7
 
 require (
 	github.com/gofrs/uuid/v5 v5.4.0
-	github.com/sagernet/sing v0.8.9
+	github.com/sagernet/sing v0.7.18
 	golang.org/x/net v0.50.0
 )
 

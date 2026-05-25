@@ -61,7 +61,8 @@ func (c *clientTLS) ServerName() string                          { return c.cfg.
 func (c *clientTLS) SetServerName(s string)                      { c.cfg.ServerName = s }
 func (c *clientTLS) NextProtos() []string                        { return c.cfg.NextProtos }
 func (c *clientTLS) SetNextProtos(p []string)                    { c.cfg.NextProtos = p }
-func (c *clientTLS) STDConfig() (*tls.Config, error)             { return c.cfg.Clone(), nil }
+func (c *clientTLS) STDConfig() (*tls.Config, error) { return c.cfg.Clone(), nil }
+func (c *clientTLS) Config() (*tls.Config, error)             { return c.cfg.Clone(), nil }
 func (c *clientTLS) Client(conn net.Conn) (aTLS.Conn, error)     { return &stdTLSConn{Conn: tls.Client(conn, c.cfg.Clone()), under: conn}, nil }
 func (c *clientTLS) Clone() aTLS.Config                          { return &clientTLS{cfg: c.cfg.Clone()} }
 
@@ -76,7 +77,8 @@ func (s *serverTLS) ServerName() string                          { return "" }
 func (s *serverTLS) SetServerName(string)                        {}
 func (s *serverTLS) NextProtos() []string                        { return s.cfg.NextProtos }
 func (s *serverTLS) SetNextProtos(p []string)                    { s.cfg.NextProtos = p }
-func (s *serverTLS) STDConfig() (*tls.Config, error)             { return s.cfg.Clone(), nil }
+func (s *serverTLS) STDConfig() (*tls.Config, error) { return s.cfg.Clone(), nil }
+func (s *serverTLS) Config() (*tls.Config, error)             { return s.cfg.Clone(), nil }
 func (s *serverTLS) Client(conn net.Conn) (aTLS.Conn, error)     { return &stdTLSConn{Conn: tls.Client(conn, s.cfg.Clone()), under: conn}, nil }
 func (s *serverTLS) Clone() aTLS.Config                          { return &serverTLS{cfg: s.cfg.Clone()} }
 func (s *serverTLS) Start() error                                { return nil }
