@@ -1,12 +1,9 @@
 package xhttp
 
 // uploadQueue is a specialized priorityqueue + channel to reorder generic
-// packets by a sequence number. Adapted (with minimal changes) from
-// xray-core/transport/internet/splithttp/upload_queue.go.
-//
-// The only behavioural change vs. Xray is that we drop the Packet.Reader
-// short-circuit, because we don't need to share this primitive with stream-up
-// mode in sing-xhttp (stream-up uses io.Pipe directly).
+// packets by a sequence number. Packets may arrive out of order from
+// concurrent POST requests; the queue buffers and reorders them before
+// the server reads them in sequence.
 
 import (
 	"container/heap"

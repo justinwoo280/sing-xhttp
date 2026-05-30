@@ -84,6 +84,9 @@ func (s *httpSession) markConnected() {
 const tcpReadHeaderTimeout = 15 * time.Second
 
 func NewServer(ctx context.Context, logger logger.ContextLogger, options Options, tlsConfig aTLS.ServerConfig, handler ServerHandler) (*Server, error) {
+	if err := options.Validate(); err != nil {
+		return nil, err
+	}
 	if options.Mode == "" {
 		options.Mode = ModePacketUp
 	}
@@ -226,6 +229,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Methods", "*")
 		w.Header().Set("Access-Control-Allow-Headers", "*")
 		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// Validate x_padding to prevent probing.
+	paddingValue := s.codec.extractPaddingFromRequest(r)
+	if !s.codec.validatePadding(paddingValue) {
+		s.invalid(w, r, http.StatusBadRequest, E.New("invalid x_padding"))
 		return
 	}
 

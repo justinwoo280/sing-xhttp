@@ -150,14 +150,83 @@ sessions over up to N conns without per-conn caps.
 - `sc_max_each_post_bytes` (default 1 MB) caps the size of each uplink
   POST in `packet-up` mode. Smaller values mean more POSTs per MB.
 - `sc_max_buffered_posts` (default 30) limits how many out-of-order POSTs
-  the server holds before EOF-ing the session. **On H1.1 the connection
-  pool serializes POSTs**, so combinations like `sc_max_each_post_bytes=8192`
-  with a 4 MB write quickly produce 500+ in-flight POSTs and stall on the
-  default `sc_max_buffered_posts=30`. Either raise the buffered-post
-  cap or keep the per-post chunk near 1 MB. H2 multiplexes so the cap
-  matters less in practice.
+  the server holds before EOF-ing the session. It guards against a client
+  sending seq numbers far ahead of what the server can reassemble. Raising
+  it does **not** help small-chunk throughput — the bottleneck there is
+  per-POST pacing, not the reorder buffer (verified: 30 vs 256 made no
+  difference in the benchmark). H2 multiplexes POSTs so the cap rarely
+  bites in practice.
 - Both client and server must agree on `sc_max_each_post_bytes` — the server
   rejects oversized POSTs.
+
+### Recommended packet-up settings
+
+`packet-up` is inherently a stream of short, high-frequency POSTs, so it
+will never match `stream-up` throughput — don't expect it to. The knobs
+below trade obfuscation for speed; pick based on what you need.
+
+- **Throughput-first:** keep `sc_max_each_post_bytes` near the 1 MB default
+  and leave `sc_min_posts_interval_ms` at its default. This already hits
+  ~32 MB/s in the loopback benchmark. Fewer, larger POSTs is the single
+  biggest lever.
+- **Obfuscation-first (small chunks):** if you set a small
+  `sc_max_each_post_bytes` (e.g. 16 KB) to blend in, the per-POST pacing
+  interval dominates and throughput drops sharply. To recover some of it,
+  configure an `xmux` pool with `max_connections > 1`: the pacing interval
+  is applied **per connection**, so a session's POSTs fan out across the
+  pool and the intervals overlap in parallel. In the benchmark, 16 KB
+  chunks go from ~0.5 MB/s (single connection) to ~1.8 MB/s with
+  `max_connections: 4` — a 3–4x gain, not free 4x, because a single
+  session only spreads over connections the pool has already opened.
+- **`sc_min_posts_interval_ms`** defaults to `{30, 30}` (30 ms). Lowering it
+  raises throughput at the cost of a more bursty, more fingerprintable POST
+  cadence. Setting `{0, 0}` is treated as "unset" and restores the 30 ms
+  default — use a small non-zero value like `{1, 1}` if you genuinely want
+  to disable pacing.
+
+  Note: the per-connection pacing here intentionally differs from stock
+  Xray, which serializes the interval globally. It does not change the wire
+  format (the server never inspects POST timing), so interop is unaffected.
+
+## Benchmarks
+
+Loopback echo over a self-signed H2 connection on a 13th-gen i5 laptop. These
+are relative-comparison numbers (single machine, no real network), not
+absolute throughput claims. Reproduce with:
+
+```sh
+GOARCH=amd64 go test ./xhttp/ -run='^$' -bench='Throughput|Dial' -benchtime=50x
+```
+
+| Benchmark | Throughput | Notes |
+|---|---|---|
+| stream-up, 1 MB | ~190 MB/s | single long-lived POST, no per-packet overhead |
+| packet-up TLS, 1 MB | ~32 MB/s | default 1 MB post chunk |
+| packet-up plaintext, 1 MB | ~32 MB/s | H1 pool, comparable to H2 at 1 MB chunk |
+| packet-up TLS, 1 MB, 16 KB chunks | ~0.5 MB/s | single connection — pacing-bound |
+| packet-up TLS, 1 MB, 16 KB chunks, `max_connections: 4` | ~1.8 MB/s | pacing fans out across the pool |
+
+The 16 KB-chunk rows show the per-POST pacing cost: small
+`sc_max_each_post_bytes` means many POSTs, each gated by
+`sc_min_posts_interval_ms`. On a single connection the intervals serialize;
+an `xmux` pool spreads them across connections to recover 3–4x. For real
+throughput, keep the per-post chunk near 1 MB, or use stream-up where a
+single POST carries the whole uplink.
+
+CPU micro-benchmarks (`-bench='GeneratePadding|ApplyMeta|ApplyPadding'`) show
+the request hot path is cheap (~0.4–0.5 µs to place meta), with default-mode
+padding being the most expensive step (~2.7 µs, URL clone + query re-encode)
+and `tokenish` padding ~20x costlier than `repeat-x` due to its HPACK-length
+feedback loop.
+
+## Options validation
+
+`xhttp.Options.Validate()` runs automatically inside `NewClient` / `NewServer`
+and rejects inconsistent configuration before any wire activity: unknown mode,
+invalid session/seq/padding placements, a session+seq collision on the same
+non-path placement and key, unknown padding method, and malformed ranges
+(negative bounds or `To < From`). Empty fields are treated as "use default"
+and accepted.
 
 ## TODO
 

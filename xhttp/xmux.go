@@ -41,13 +41,38 @@ type xmuxClient struct {
 	leftUsage    int32        // remaining Pick() returns; -1 = unlimited (protected by manager mu)
 	leftRequests atomic.Int32 // remaining sessions before retirement; MaxInt32 = unlimited
 	unreusableAt time.Time    // zero = never expire
+
+	postMu     sync.Mutex // guards nextPostAt
+	nextPostAt time.Time  // earliest wall-clock time the next POST on this conn may start
+}
+
+// reservePostSlot enforces a per-connection minimum spacing between POSTs.
+// It atomically advances this connection's nextPostAt by a randomized
+// interval and returns how long the caller should wait before sending.
+//
+// Spacing is per-connection rather than global so that POSTs on different
+// xmux connections proceed in parallel: each connection still presents the
+// anti-burst jitter the interval is meant to provide, but aggregate
+// throughput scales with the pool size instead of being globally serialized.
+func (x *xmuxClient) reservePostSlot(interval Range) time.Duration {
+	if interval.From <= 0 {
+		return 0
+	}
+	gap := time.Duration(rangeRand(interval)) * time.Millisecond
+	x.postMu.Lock()
+	defer x.postMu.Unlock()
+	now := time.Now()
+	if x.nextPostAt.IsZero() || now.After(x.nextPostAt) {
+		x.nextPostAt = now.Add(gap)
+		return 0
+	}
+	wait := x.nextPostAt.Sub(now)
+	x.nextPostAt = x.nextPostAt.Add(gap)
+	return wait
 }
 
 // xmuxManager picks an xmuxClient per session, creating new connections up
 // to MaxConnections and retiring them when their limits are exhausted.
-//
-// Ported from Xray-core/transport/internet/splithttp/mux.go. Method
-// signatures align with that file so reviewers can diff easily.
 type xmuxManager struct {
 	mu          sync.Mutex
 	config      XmuxConfig
@@ -136,7 +161,7 @@ func (m *xmuxManager) Pick() *xmuxClient {
 		candidates = m.clients
 	}
 
-	// All saturated: spawn a fresh client even past MaxConnections (mirrors Xray).
+	// All saturated: spawn a fresh client even past MaxConnections.
 	if len(candidates) == 0 {
 		return m.newClient()
 	}
@@ -157,6 +182,30 @@ func (m *xmuxManager) Close() {
 		c.conn.Close()
 	}
 	m.clients = nil
+}
+
+// poolsConnections reports whether this manager is configured to spread work
+// over more than one connection. MaxConnections == 0 means "unlimited", which
+// in practice still behaves as a single connection until saturated, so it is
+// not treated as a multi-connection pool here.
+func (m *xmuxManager) poolsConnections() bool {
+	return m.connections > 1
+}
+
+// liveClients returns a snapshot of the currently-pooled, non-retired clients.
+// Used by the packet uploader to fan a single session's POSTs across the pool
+// for parallel pacing, without disturbing the session-level concurrency
+// bookkeeping that Pick() maintains.
+func (m *xmuxManager) liveClients() []*xmuxClient {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]*xmuxClient, 0, len(m.clients))
+	for _, c := range m.clients {
+		if !c.conn.IsClosed() {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 func randIndex(n int) int {

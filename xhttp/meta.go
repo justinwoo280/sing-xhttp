@@ -126,7 +126,7 @@ func (c *codec) applyPaddingToRequest(req *http.Request) {
 		return
 	}
 	if !c.xpadObfs {
-		// Xray default: query-in-header with Referer / x_padding=...
+		// Default: query-in-header with Referer / x_padding=...
 		ref := *req.URL
 		q := ref.Query()
 		q.Set("x_padding", generatePadding(PaddingMethodRepeatX, n))
@@ -224,6 +224,92 @@ func extractField(r *http.Request, placement, key string, takePath func() string
 	return ""
 }
 
+// --- server side: padding validation --------------------------------------
+
+// extractPaddingFromRequest retrieves the x_padding value from the request
+// according to the configured placement and obfuscation mode.
+//
+// Default mode (obfs=false): padding is in the Referer header as a query
+// parameter named "x_padding". Falls back to a direct URL query parameter
+// if no Referer is present.
+//
+// Obfs mode (obfs=true): padding is in the location specified by
+// xpadPlacement (header, cookie, query, or queryInHeader).
+func (c *codec) extractPaddingFromRequest(r *http.Request) string {
+	if !c.xpadObfs {
+		// Default: Referer contains URL with ?x_padding=...
+		referrer := r.Header.Get("Referer")
+		if referrer != "" {
+			if refURL, err := url.Parse(referrer); err == nil {
+				return refURL.Query().Get("x_padding")
+			}
+		}
+		// Fallback: direct query param.
+		return r.URL.Query().Get("x_padding")
+	}
+
+	// Obfs mode: extract from configured placement.
+	switch c.xpadPlacement {
+	case PlacementCookie:
+		if ck, err := r.Cookie(c.xpadKey); err == nil {
+			return ck.Value
+		}
+	case PlacementHeader:
+		return r.Header.Get(c.xpadHeader)
+	case PlacementQuery:
+		return r.URL.Query().Get(c.xpadKey)
+	case PlacementQueryInHeader:
+		headerVal := r.Header.Get(c.xpadHeader)
+		if headerVal != "" {
+			if parsed, err := url.Parse(headerVal); err == nil {
+				return parsed.Query().Get(c.xpadKey)
+			}
+		}
+	}
+	return ""
+}
+
+// validatePadding checks whether the extracted padding value falls within
+// the configured byte range [xpadRange.From, xpadRange.To].
+//
+// For repeat-x (or default non-obfs mode): the raw string length is checked.
+// For tokenish (obfs mode only): the HPACK Huffman-encoded byte length is
+// checked, with ±validationTolerance allowance.
+//
+// Empty padding is always rejected. If xpadRange.To == 0 (unconfigured or
+// explicitly zero), validation is skipped (returns true).
+func (c *codec) validatePadding(paddingValue string) bool {
+	if paddingValue == "" {
+		return false
+	}
+
+	from := c.xpadRange.From
+	to := c.xpadRange.To
+	if to <= 0 {
+		return true // no range configured — skip validation
+	}
+
+	// In default (non-obfs) mode the client always generates repeat-x.
+	method := c.xpadMethod
+	if !c.xpadObfs {
+		method = PaddingMethodRepeatX
+	}
+
+	switch method {
+	case PaddingMethodTokenish:
+		n := int32(hpack.HuffmanEncodeLength(paddingValue))
+		f := from - validationTolerance
+		t := to + validationTolerance
+		if f < 0 {
+			f = 0
+		}
+		return n >= f && n <= t
+	default: // repeat-x or unset
+		n := int32(len(paddingValue))
+		return n >= from && n <= to
+	}
+}
+
 // --- padding generators ---------------------------------------------------
 
 const charsetBase62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -247,7 +333,6 @@ func generatePadding(method string, length int) string {
 
 // generateTokenishBase62 produces a random base62 string whose HPACK Huffman
 // encoded byte length is within ±validationTolerance of targetHuffmanBytes.
-// Ported from Xray-core/transport/internet/splithttp/xpadding.go.
 func generateTokenishBase62(targetHuffmanBytes int) string {
 	n := int(math.Ceil(float64(targetHuffmanBytes) / avgHuffmanBytesPerCharBase62))
 	if n < 1 {
@@ -314,12 +399,7 @@ func randStringFromCharset(n int, charset string) (string, bool) {
 
 // --- helpers --------------------------------------------------------------
 
-// buildBaseURL returns the configured base path as a URL.URL relative root.
-// Path-placement fields will append onto this; non-path placements leave the
-// path equal to basePath.
-var _ = url.URL{} // keep import even when unused after refactor
-
-// normalizePath matches Xray's GetNormalizedPath: ensures leading and trailing slash.
+// normalizePath ensures leading and trailing slash, stripping any query.
 func normalizePath(p string) string {
 	if idx := strings.IndexByte(p, '?'); idx >= 0 {
 		p = p[:idx]

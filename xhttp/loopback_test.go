@@ -397,3 +397,312 @@ func (h holdHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source 
 		}
 	}()
 }
+
+// --- async POST / batching integration tests ---
+
+func TestPacketUpManySmallWrites(t *testing.T) {
+	// Verify that many small writes (1 byte each) are properly batched
+	// and delivered through the async POST pipeline.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	port := listener.Addr().(*net.TCPAddr).Port
+
+	logger := logger.NOP()
+	ctx := context.Background()
+	sTLS, cTLS := makeTLSPair(t)
+
+	opts := xhttp.Options{
+		Mode: xhttp.ModePacketUp,
+		Path: "/xhttp",
+		ScMaxEachPostBytes: &xhttp.Range{From: 4096, To: 4096},
+	}
+
+	server, err := xhttp.NewServer(ctx, logger, opts, anyServerTLS(sTLS), echoHandler{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	go server.Serve(listener)
+	time.Sleep(50 * time.Millisecond)
+
+	client, err := xhttp.NewClient(ctx, directDialer{}, M.ParseSocksaddrHostPort("127.0.0.1", uint16(port)), opts, anyClientTLS(cTLS))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	conn, err := client.DialContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Write 2000 single bytes — these should be batched by the accumulator.
+	const totalBytes = 2000
+	expected := make([]byte, totalBytes)
+	for i := range expected {
+		expected[i] = byte(i % 256)
+	}
+
+	var wg sync.WaitGroup
+	recv := make([]byte, totalBytes)
+	var readErr error
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, readErr = io.ReadFull(conn, recv)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < totalBytes; i++ {
+			if _, err := conn.Write(expected[i : i+1]); err != nil {
+				return
+			}
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for small-write echo")
+	}
+	if readErr != nil {
+		t.Fatalf("read err: %v", readErr)
+	}
+	if !bytes.Equal(expected, recv) {
+		t.Fatal("data mismatch in small-write echo test")
+	}
+}
+
+func TestPacketUpLargePayload(t *testing.T) {
+	// 512 KB payload: exercises concurrent POST goroutines (at 4KB chunks,
+	// this means ~128 POSTs, many of which should be in-flight concurrently
+	// on the H2 connection).
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	port := listener.Addr().(*net.TCPAddr).Port
+
+	logger := logger.NOP()
+	ctx := context.Background()
+	sTLS, cTLS := makeTLSPair(t)
+
+	opts := xhttp.Options{
+		Mode: xhttp.ModePacketUp,
+		Path: "/xhttp",
+		ScMaxEachPostBytes: &xhttp.Range{From: 4096, To: 4096},
+	}
+
+	server, err := xhttp.NewServer(ctx, logger, opts, anyServerTLS(sTLS), echoHandler{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	go server.Serve(listener)
+	time.Sleep(50 * time.Millisecond)
+
+	client, err := xhttp.NewClient(ctx, directDialer{}, M.ParseSocksaddrHostPort("127.0.0.1", uint16(port)), opts, anyClientTLS(cTLS))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	conn, err := client.DialContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	payload := make([]byte, 512*1024)
+	rand.Read(payload)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	recv := make([]byte, len(payload))
+	var readErr error
+	go func() {
+		defer wg.Done()
+		_, readErr = io.ReadFull(conn, recv)
+	}()
+	go func() {
+		defer wg.Done()
+		io.Copy(conn, bytes.NewReader(payload))
+	}()
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("timeout waiting for large payload echo")
+	}
+	if readErr != nil {
+		t.Fatalf("read err: %v", readErr)
+	}
+	if !bytes.Equal(payload, recv) {
+		t.Fatal("data mismatch in large payload echo test")
+	}
+}
+
+// --- Transport optimization tests ---
+
+func TestPathQueryPassthrough(t *testing.T) {
+	// Verify that a path with ?key=val works end-to-end.
+	// If the query were incorrectly left in the path, the server's
+	// prefix match would fail and the connection would not work.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	port := listener.Addr().(*net.TCPAddr).Port
+
+	logger := logger.NOP()
+	ctx := context.Background()
+	sTLS, cTLS := makeTLSPair(t)
+
+	opts := xhttp.Options{
+		Mode: xhttp.ModePacketUp,
+		Path: "/xhttp?cover=true&style=fancy",
+		ScMaxEachPostBytes: &xhttp.Range{From: 4096, To: 4096},
+	}
+
+	server, err := xhttp.NewServer(ctx, logger, opts, anyServerTLS(sTLS), echoHandler{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	go server.Serve(listener)
+	time.Sleep(50 * time.Millisecond)
+
+	client, err := xhttp.NewClient(ctx, directDialer{}, M.ParseSocksaddrHostPort("127.0.0.1", uint16(port)), opts, anyClientTLS(cTLS))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	conn, err := client.DialContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Simple echo round-trip.
+	payload := make([]byte, 8192)
+	rand.Read(payload)
+
+	var wg sync.WaitGroup
+	recv := make([]byte, len(payload))
+	var readErr error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, readErr = io.ReadFull(conn, recv)
+	}()
+	go func() {
+		defer wg.Done()
+		conn.Write(payload)
+	}()
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout")
+	}
+	if readErr != nil {
+		t.Fatalf("read err: %v", readErr)
+	}
+	if !bytes.Equal(payload, recv) {
+		t.Fatal("data mismatch with path query")
+	}
+}
+
+func TestXmuxMidUploadRotation(t *testing.T) {
+	// Configure xmux with a low HMaxRequestTimes so that connections
+	// rotate *during* a single packet-up session's upload. With small
+	// post sizes and a large payload, rotation fires mid-stream.
+	// Data integrity must be preserved across the rotation.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	port := listener.Addr().(*net.TCPAddr).Port
+
+	logger := logger.NOP()
+	ctx := context.Background()
+	sTLS, cTLS := makeTLSPair(t)
+
+	opts := xhttp.Options{
+		Mode: xhttp.ModePacketUp,
+		Path: "/xhttp",
+		ScMaxEachPostBytes: &xhttp.Range{From: 1024, To: 1024},
+		Xmux: &xhttp.XmuxConfig{
+			HMaxRequestTimes: &xhttp.Range{From: 5, To: 5},
+		},
+	}
+
+	server, err := xhttp.NewServer(ctx, logger, opts, anyServerTLS(sTLS), echoHandler{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	go server.Serve(listener)
+	time.Sleep(50 * time.Millisecond)
+
+	client, err := xhttp.NewClient(ctx, directDialer{}, M.ParseSocksaddrHostPort("127.0.0.1", uint16(port)), opts, anyClientTLS(cTLS))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	conn, err := client.DialContext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// 32 KB payload → ~32 POSTs at 1024 bytes each.
+	// HMaxRequestTimes=5, so xmux should rotate ~6 times.
+	payload := make([]byte, 32*1024)
+	rand.Read(payload)
+
+	var wg sync.WaitGroup
+	recv := make([]byte, len(payload))
+	var readErr error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, readErr = io.ReadFull(conn, recv)
+	}()
+	go func() {
+		defer wg.Done()
+		io.Copy(conn, bytes.NewReader(payload))
+	}()
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("timeout waiting for xmux rotation echo")
+	}
+	if readErr != nil {
+		t.Fatalf("read err: %v", readErr)
+	}
+	if !bytes.Equal(payload, recv) {
+		t.Fatal("data mismatch after xmux mid-upload rotation")
+	}
+}

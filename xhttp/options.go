@@ -13,7 +13,7 @@ const (
 // Not all placements are valid for every field:
 //   - sessionId / seq: path, query, header, cookie
 //   - x_padding (obfsMode=true):   query, header, cookie
-//   - x_padding (obfsMode=false):  always query-in-header (Referer / x_padding) — Xray default
+//   - x_padding (obfsMode=false):  always query-in-header (Referer / x_padding) — default mode
 const (
 	PlacementPath          = "path"
 	PlacementQuery         = "query"
@@ -34,8 +34,7 @@ type Range struct {
 	To   int32 `json:"to,omitempty"`
 }
 
-// Options mirrors the subset of Xray splithttp.Config we care about.
-// JSON shape kept close to Xray for interop convenience.
+// Options configures an XHTTP transport session.
 type Options struct {
 	Mode    string               `json:"mode,omitempty"`           // "packet-up" (default) | "stream-up"
 	Host    string               `json:"host,omitempty"`           // request Host header
@@ -54,14 +53,14 @@ type Options struct {
 
 	// Padding obfuscation / placement (P2). When XPaddingObfsMode is false (default), the
 	// other XPadding* fields are ignored and padding is written via Referer-with-query —
-	// matching stock Xray's default and ensuring out-of-the-box interop.
+	// matching the default and ensuring out-of-the-box interop.
 	XPaddingObfsMode bool   `json:"x_padding_obfs_mode,omitempty"`
 	XPaddingPlacement string `json:"x_padding_placement,omitempty"` // query | header | cookie
 	XPaddingKey       string `json:"x_padding_key,omitempty"`       // default "x_padding"
 	XPaddingHeader    string `json:"x_padding_header,omitempty"`    // default "X-Padding" (used for header placement)
 	XPaddingMethod    string `json:"x_padding_method,omitempty"`    // repeat-x (default) | tokenish
 
-	// Session / seq placement (P2). Default = path (Xray default).
+	// Session / seq placement. Default = path.
 	SessionPlacement string `json:"session_placement,omitempty"` // path | query | header | cookie
 	SessionKey       string `json:"session_key,omitempty"`       // header/cookie/query name; default per placement
 	SeqPlacement     string `json:"seq_placement,omitempty"`     // path | query | header | cookie
@@ -75,13 +74,14 @@ type Options struct {
 	Xmux *XmuxConfig `json:"xmux,omitempty"`
 }
 
-// XmuxConfig mirrors Xray's XmuxConfig. All zero == unlimited.
+// XmuxConfig configures the HTTP connection pool. All zero == unlimited.
 type XmuxConfig struct {
 	MaxConcurrency   *Range `json:"max_concurrency,omitempty"`     // max in-flight sessions per connection; 0 = unlimited
 	MaxConnections   *Range `json:"max_connections,omitempty"`     // max simultaneous connections; 0 = unlimited
 	CMaxReuseTimes   *Range `json:"c_max_reuse_times,omitempty"`   // max times a connection is picked; 0 = unlimited
 	HMaxRequestTimes *Range `json:"h_max_request_times,omitempty"` // max sessions served per connection; 0 = unlimited
 	HMaxReusableSecs *Range `json:"h_max_reusable_secs,omitempty"` // wall-clock lifetime of a connection in seconds; 0 = unlimited
+	HKeepAlivePeriod int32  `json:"h_keep_alive_period,omitempty"` // H2 PING interval in seconds; 0 = 30s default; -1 = disable
 }
 
 func (r *Range) orDefault(from, to int32) Range {

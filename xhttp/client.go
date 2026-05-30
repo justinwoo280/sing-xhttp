@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -43,7 +44,18 @@ type Client struct {
 }
 
 func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, options Options, tlsConfig aTLS.Config) (*Client, error) {
-	newTransport := buildTransportFactory(dialer, tlsConfig)
+	if err := options.Validate(); err != nil {
+		return nil, err
+	}
+	// Compute H2 keep-alive period from xmux config.
+	var keepAlive time.Duration = 30 * time.Second // Chrome-like default
+	if options.Xmux != nil && options.Xmux.HKeepAlivePeriod != 0 {
+		keepAlive = time.Duration(options.Xmux.HKeepAlivePeriod) * time.Second
+		if keepAlive < 0 {
+			keepAlive = 0 // explicitly disable
+		}
+	}
+	newTransport := buildTransportFactory(dialer, tlsConfig, keepAlive)
 
 	mode := options.Mode
 	switch mode {
@@ -69,6 +81,14 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 		options.Path = "/" + options.Path
 	}
 
+	// Split path and query so that ?key=val in the configured path
+	// is preserved in the actual request URL.
+	var rawQuery string
+	if i := strings.IndexByte(options.Path, '?'); i >= 0 {
+		rawQuery = options.Path[i+1:]
+		options.Path = options.Path[:i]
+	}
+
 	var requestURL url.URL
 	if tlsConfig == nil {
 		requestURL.Scheme = "http"
@@ -77,6 +97,7 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	}
 	requestURL.Host = serverAddr.String()
 	requestURL.Path = options.Path
+	requestURL.RawQuery = rawQuery
 
 	host := options.Host
 	if host == "" && tlsConfig != nil {
@@ -119,17 +140,22 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// buildTransportFactory returns a function that creates a fresh http.RoundTripper
-// per pooled xmuxConn. Plaintext gets a stock http.Transport; TLS gets an
-// http2.Transport.
-func buildTransportFactory(dialer N.Dialer, tlsConfig aTLS.Config) func() http.RoundTripper {
+// buildTransportFactory returns a function that creates a fresh
+// http.RoundTripper per pooled xmuxConn. Plaintext gets a stock
+// http.Transport; TLS gets an http2.Transport.
+func buildTransportFactory(dialer N.Dialer, tlsConfig aTLS.Config, keepAlivePeriod time.Duration) func() http.RoundTripper {
 	if tlsConfig == nil {
 		return func() http.RoundTripper {
 			return &http.Transport{
 				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 					return dialer.DialContext(ctx, network, M.ParseSocksaddr(addr))
 				},
-				ForceAttemptHTTP2: false,
+				ForceAttemptHTTP2:   false,
+				DisableKeepAlives:   false,
+				IdleConnTimeout:     300 * time.Second,
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 10,
+				MaxConnsPerHost:     20,
 			}
 		}
 	}
@@ -150,7 +176,10 @@ func buildTransportFactory(dialer N.Dialer, tlsConfig aTLS.Config) func() http.R
 				}
 				return tlsConn, nil
 			},
-			ReadIdleTimeout: 0,
+			ReadIdleTimeout:                keepAlivePeriod,
+			IdleConnTimeout:                300 * time.Second,
+			MaxHeaderListSize:              10 << 20, // 10 MB
+			StrictMaxConcurrentStreams:     true,
 		}
 	}
 }
@@ -269,6 +298,13 @@ func (c *Client) dialStreamUp(ctx context.Context, sessionID string, xc *xmuxCli
 
 // --- packet-up ---
 
+// maxConcurrentPosts limits the number of in-flight packet-up POST
+// goroutines per session. For HTTP/2, the transport multiplexes them
+// onto a single connection; for HTTP/1.1, the transport serializes
+// them via connection pooling. This prevents goroutine explosion when
+// the application writes faster than the network can send.
+const maxConcurrentPosts = 32
+
 func (c *Client) dialPacketUp(ctx context.Context, sessionID string, xc *xmuxClient) (net.Conn, error) {
 	downBody, remote, local, err := c.openDownload(ctx, sessionID, xc)
 	if err != nil {
@@ -276,12 +312,13 @@ func (c *Client) dialPacketUp(ctx context.Context, sessionID string, xc *xmuxCli
 		return nil, err
 	}
 
-	// Internal pipe: upper layer writes -> we batch & split into POSTs.
-	pr, pw := io.Pipe()
 	maxEach := int(rangeRand(c.maxEachPost))
 	if maxEach < 1 {
 		maxEach = 1
 	}
+
+	// batchAccumulator batches small writes into larger POST chunks.
+	acc := newBatchAccumulator(maxEach)
 
 	uctx, cancel := context.WithCancel(ctx)
 	closeOnce := atomic.Bool{}
@@ -291,56 +328,124 @@ func (c *Client) dialPacketUp(ctx context.Context, sessionID string, xc *xmuxCli
 		}
 		cancel()
 		xc.openUsage.Add(-1)
-		_ = pw.Close()
+		_ = acc.Close()
 		return downBody.Close()
 	}
 
-	go c.runPacketUploader(uctx, sessionID, pr, maxEach, downBody, pw, xc)
+	go c.runPacketUploader(uctx, sessionID, acc, xc, closeAll)
 
 	return &splitConn{
 		reader:  downBody,
-		writer:  pw,
+		writer:  acc,
 		local:   local,
 		remote:  remote,
 		onClose: closeAll,
 	}, nil
 }
 
-func (c *Client) runPacketUploader(ctx context.Context, sessionID string, pr *io.PipeReader, maxEach int, downBody io.Closer, pw *io.PipeWriter, xc *xmuxClient) {
-	var seq uint64
-	var lastWrite time.Time
+// runPacketUploader drains batched chunks from the accumulator and sends
+// them as concurrent POST requests. Sequence numbers are assigned in the
+// main loop (single-threaded), ensuring correct ordering at the server's
+// uploadQueue. The POSTs themselves run concurrently via goroutines,
+// bounded by a semaphore of size maxConcurrentPosts.
+func (c *Client) runPacketUploader(
+	ctx context.Context,
+	sessionID string,
+	acc *batchAccumulator,
+	xc *xmuxClient,
+	closeAll func() error,
+) {
+	var (
+		seq    uint64
+		wg     sync.WaitGroup
+		failed atomic.Bool
+	)
 
-	buffer := make([]byte, maxEach)
+	sem := make(chan struct{}, maxConcurrentPosts)
+	defer wg.Wait()
+
+	// When the pool spans multiple connections, fan this session's POSTs
+	// across them so per-connection pacing intervals overlap in parallel.
+	// The session stays bound to xc for concurrency bookkeeping; the extra
+	// connections are only borrowed to carry POSTs, so we don't touch their
+	// openUsage/leftUsage counters here.
+	spread := c.xmux.poolsConnections()
+	var fanout []*xmuxClient
+	var fanIdx int
+	if spread {
+		fanout = c.xmux.liveClients()
+	}
+
 	for {
-		n, err := pr.Read(buffer)
-		if n > 0 {
-			// Optional minimum spacing between POSTs.
-			if c.minPostInterval.From > 0 {
-				wait := time.Duration(rangeRand(c.minPostInterval))*time.Millisecond - time.Since(lastWrite)
-				if wait > 0 {
-					select {
-					case <-time.After(wait):
-					case <-ctx.Done():
-						return
-					}
-				}
-			}
-			lastWrite = time.Now()
-
-			chunk := make([]byte, n)
-			copy(chunk, buffer[:n])
-			seqStr := strconv.FormatUint(seq, 10)
-			seq++
-
-			if postErr := c.sendOnePost(ctx, sessionID, seqStr, chunk, xc); postErr != nil {
-				_ = pw.CloseWithError(postErr)
-				_ = downBody.Close()
-				return
-			}
-		}
-		if err != nil {
+		if failed.Load() {
 			return
 		}
+
+		chunk, err := acc.Drain()
+		if err != nil || len(chunk) == 0 {
+			return
+		}
+
+		// Re-check after Drain in case a POST failed while we were blocked.
+		if failed.Load() {
+			return
+		}
+
+		// Rotate the bound connection when it hits its lifetime caps. Pick()
+		// sweeps any connection past its request/time budget.
+		if xc.leftRequests.Add(-1) <= 0 ||
+			(!xc.unreusableAt.IsZero() && time.Now().After(xc.unreusableAt)) {
+			newXc := c.xmux.Pick()
+			newXc.openUsage.Add(1)
+			xc.openUsage.Add(-1)
+			xc = newXc
+			if spread {
+				fanout = c.xmux.liveClients()
+			}
+		}
+
+		// Choose the connection this POST rides on: round-robin over the pool
+		// when spreading, otherwise the session's bound connection.
+		postXc := xc
+		if spread && len(fanout) > 0 {
+			postXc = fanout[fanIdx%len(fanout)]
+			fanIdx++
+		}
+
+		seqStr := strconv.FormatUint(seq, 10)
+		seq++
+
+		// Acquire concurrency slot.
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
+
+		wg.Add(1)
+		go func(seqStr string, payload []byte, postXc *xmuxClient) {
+			defer func() {
+				<-sem
+				wg.Done()
+			}()
+
+			// Per-connection minimum spacing. Reserving a slot returns the
+			// wait this POST owes on its connection; different connections
+			// wait independently, so the pool sends in parallel.
+			if wait := postXc.reservePostSlot(c.minPostInterval); wait > 0 {
+				select {
+				case <-time.After(wait):
+				case <-ctx.Done():
+					return
+				}
+			}
+
+			if postErr := c.sendOnePost(ctx, sessionID, seqStr, payload, postXc); postErr != nil {
+				failed.Store(true)
+				_ = acc.CloseWithError(postErr)
+				_ = closeAll()
+			}
+		}(seqStr, chunk, postXc)
 	}
 }
 
