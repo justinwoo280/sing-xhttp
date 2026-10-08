@@ -64,6 +64,12 @@ type Options struct {
 	NoGRPCHeader bool `json:"no_grpc_header,omitempty"` // disable Content-Type: application/grpc on stream-up POST
 	NoSSEHeader  bool `json:"no_sse_header,omitempty"`  // disable Content-Type: text/event-stream on download GET
 
+	// GRPCFraming uses gRPC messages containing protobuf bytes field 1 for
+	// stream-up uploads and both directions of stream-one. Both peers must
+	// enable it; stock Xray uses unframed bodies. The RPC is <path>/Tun, with
+	// stream-up's session ID in X-Xhttp-Session. Its download GET is unchanged.
+	GRPCFraming bool `json:"grpc_framing,omitempty"`
+
 	XPaddingBytes        *Range `json:"x_padding_bytes,omitempty"`          // default {100,1000}
 	ScMaxEachPostBytes   *Range `json:"sc_max_each_post_bytes,omitempty"`   // default {1_000_000,1_000_000}
 	ScMaxBufferedPosts   int32  `json:"sc_max_buffered_posts,omitempty"`    // default 30

@@ -47,6 +47,56 @@ stock Xray server (`xhttp` transport, default config) and vice versa.
 Local tuning defaults (POST sizing / pacing) also match Xray's — see
 [Defaults](#defaults).
 
+### gRPC framing for streaming proxies
+
+Stock XHTTP sends raw bytes even when the upload advertises
+`Content-Type: application/grpc`. This works with some HTTP streaming proxies,
+but is not a gRPC message stream. A proxy that decodes gRPC messages cannot
+forward that body as an RPC. The default raw format remains compatible with
+stock Xray.
+
+For a proxy that requires gRPC, enable `grpc_framing` on **both sing-xhttp
+endpoints** and select `stream-up` or `stream-one`:
+
+```json
+{
+  "mode": "stream-up",
+  "path": "/xhttp",
+  "grpc_framing": true
+}
+```
+
+This is a sing-xhttp extension and cannot communicate with an unmodified Xray
+streaming endpoint. Embedding applications must expose `Options.GRPCFraming`
+before the JSON option is available in their own configuration.
+
+- Each streaming POST targets `/xhttp/Tun` (in general, `/<service>/Tun`) and
+  sends `Content-Type: application/grpc` and `TE: trailers`. `path` names one
+  service, such as `/example.Tunnel`; the empty path uses `/xhttp/Tun`.
+- Bodies use the five-byte gRPC header and a protobuf message with
+  `bytes data = 1`, matching gRPC-lite's schema. Writes are split into at most
+  64 KiB of payload per message; received messages are limited to 4 MiB.
+  Compression is unsupported. Stream-one responses and stream-up reverse
+  heartbeats use the same encoding, with `grpc-status` response trailers.
+- In `stream-up`, the POST carries its session ID in `X-Xhttp-Session`.
+  The download remains an ordinary XHTTP GET using the configured session
+  placement. Route that GET through an HTTP streaming proxy and the POST
+  through the gRPC proxy. A route that accepts only gRPC cannot serve the GET.
+- In `stream-one`, upload and download share one bidirectional RPC. The client
+  allows the first write before receiving response headers, including when
+  the intermediary waits for the first message before forwarding headers.
+- Both peers must use matching framing settings. `no_grpc_header`, non-POST
+  uplinks, header/cookie payload placement, query padding and query strings
+  in the RPC path are incompatible with this option. A server may use
+  `mode: "auto"` to accept both framed streaming modes; a client must resolve
+  to a streaming mode.
+
+Tests cover a grpc-go proxy that decodes and re-encodes every message, a
+standard grpc-go client, HTTP/3 loopback, empty/malformed messages, cancellation
+and trailers. For gRPC middleware, use HTTP/2 on each RPC hop. The same framing
+works between sing-xhttp peers over HTTP/3, but middleware HTTP/3 support,
+request timeouts and buffering limits depend on the deployment.
+
 ## Dependencies
 
 The library has **no sing-box dependency**. Direct imports:
@@ -55,6 +105,9 @@ The library has **no sing-box dependency**. Direct imports:
 - `github.com/sagernet/quic-go` — http2 / h2c / hpack and QUIC (HTTP/3)
 - `golang.org/x/net` — http2 / h2c / hpack
 - `github.com/gofrs/uuid/v5` — session id
+- `google.golang.org/protobuf` — protobuf wire parsing for optional gRPC framing
+- `google.golang.org/grpc` — interoperability tests only; the transport does not
+  use the gRPC runtime
 
 The `ServerTransport` / `ClientTransport` / `ServerHandler` interfaces in
 `xhttp/adapter.go` are structurally identical to sing-box's

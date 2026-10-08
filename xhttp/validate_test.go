@@ -10,6 +10,9 @@ func TestValidateAcceptsValid(t *testing.T) {
 		{"empty", Options{}},
 		{"packet-up", Options{Mode: ModePacketUp}},
 		{"stream-up", Options{Mode: ModeStreamUp}},
+		{"gRPC stream-up", Options{Mode: ModeStreamUp, GRPCFraming: true, Path: "/example.Tunnel"}},
+		{"gRPC stream-one", Options{Mode: ModeStreamOne, GRPCFraming: true}},
+		{"gRPC auto server", Options{Mode: ModeAuto, GRPCFraming: true}},
 		{"all meta placements distinct", Options{
 			SessionPlacement: PlacementHeader,
 			SeqPlacement:     PlacementCookie,
@@ -78,6 +81,16 @@ func TestValidateRejectsInvalid(t *testing.T) {
 		o    Options
 	}{
 		{"bad mode", Options{Mode: "stream-two"}},
+		{"gRPC packet-up", Options{Mode: ModePacketUp, GRPCFraming: true}},
+		{"gRPC default mode", Options{GRPCFraming: true}},
+		{"gRPC without headers", Options{Mode: ModeStreamOne, GRPCFraming: true, NoGRPCHeader: true}},
+		{"gRPC GET", Options{Mode: ModeStreamOne, GRPCFraming: true, Method: "GET"}},
+		{"gRPC query path", Options{Mode: ModeStreamOne, GRPCFraming: true, Path: "/example?x=1"}},
+		{"gRPC nested path", Options{Mode: ModeStreamOne, GRPCFraming: true, Path: "/example/nested"}},
+		{"gRPC duplicate slash", Options{Mode: ModeStreamOne, GRPCFraming: true, Path: "//example//"}},
+		{"gRPC invalid service name", Options{Mode: ModeStreamOne, GRPCFraming: true, Path: "/example..Tunnel"}},
+		{"gRPC header upload", Options{Mode: ModeStreamUp, GRPCFraming: true, UplinkDataPlacement: PlacementHeader, UplinkDataKey: "X-Up"}},
+		{"gRPC query padding", Options{Mode: ModeStreamUp, GRPCFraming: true, XPaddingObfsMode: true, XPaddingPlacement: PlacementQuery}},
 		{"bad session placement", Options{SessionPlacement: "body"}},
 		{"bad seq placement", Options{SeqPlacement: "nonsense"}},
 		{"session/seq collide on header default keys", Options{

@@ -93,6 +93,14 @@ func (s *httpSession) decideStreamUp(body io.ReadCloser) bool {
 		close(s.uplinkDecided)
 		done = true
 	})
+	if done {
+		select {
+		case <-s.closed:
+			_ = body.Close()
+			return false
+		default:
+		}
+	}
 	return done
 }
 
@@ -246,14 +254,16 @@ func (s *Server) upsertSession(sessionID string) *httpSession {
 	go func() {
 		select {
 		case <-time.After(30 * time.Second):
-			s.sessionsMu.Lock()
-			if s.sessions[sessionID] == sess {
-				delete(s.sessions, sessionID)
-			}
-			s.sessionsMu.Unlock()
-			_ = sess.Close()
 		case <-sess.connected:
+			return
+		case <-sess.closed:
 		}
+		s.sessionsMu.Lock()
+		if s.sessions[sessionID] == sess {
+			delete(s.sessions, sessionID)
+		}
+		s.sessionsMu.Unlock()
+		_ = sess.Close()
 	}()
 	return sess
 }
@@ -301,10 +311,37 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	obfsPaddingAccepted := s.codec.xpadObfs && paddingValue != ""
+	if s.opts.GRPCFraming && r.Method != http.MethodGet {
+		if r.Method != http.MethodPost || r.ProtoMajor < 2 || r.URL.Path != grpcPath(s.codec.basePath) {
+			s.invalid(w, r, http.StatusNotFound, E.New("invalid gRPC method or path"))
+			return
+		}
+		if !isGRPCContentType(r.Header.Get("Content-Type")) {
+			s.invalid(w, r, http.StatusUnsupportedMediaType, E.New("gRPC content type required"))
+			return
+		}
+		if encoding := r.Header.Get("Grpc-Encoding"); encoding != "" && encoding != "identity" {
+			s.invalid(w, r, http.StatusUnsupportedMediaType, E.New("unsupported gRPC encoding"))
+			return
+		}
+		sessionID := r.Header.Get(grpcSessionHeader)
+		if sessionID == "" && s.modeAllows(ModeStreamOne) {
+			s.handleStreamOne(w, r)
+		} else if sessionID != "" && s.modeAllows(ModeStreamUp) {
+			s.handleStreamUpPost(w, r, sessionID, obfsPaddingAccepted)
+		} else {
+			s.invalid(w, r, http.StatusBadRequest, E.New("gRPC stream mode not allowed"))
+		}
+		return
+	}
 
 	sessionID, seqStr, ok := s.codec.extractMetaFromRequest(r)
 	if !ok {
 		s.invalid(w, r, http.StatusNotFound, E.New("path doesn't match base"))
+		return
+	}
+	if s.opts.GRPCFraming && (sessionID == "" || seqStr != "") {
+		s.invalid(w, r, http.StatusBadRequest, E.New("gRPC stream-up download requires a session ID without sequence"))
 		return
 	}
 
@@ -455,9 +492,23 @@ func (s *Server) handlePacketUpPost(w http.ResponseWriter, r *http.Request, sess
 
 func (s *Server) handleStreamUpPost(w http.ResponseWriter, r *http.Request, sessionID string, obfsPaddingAccepted bool) {
 	sess := s.upsertSession(sessionID)
-	if !sess.decideStreamUp(r.Body) {
+	body := r.Body
+	var framedReader *grpcReader
+	if s.opts.GRPCFraming {
+		framedReader = newGRPCReader(body)
+		body = framedReader
+	}
+	if !sess.decideStreamUp(body) {
 		s.invalid(w, r, http.StatusConflict, E.New("uplink already attached"))
 		return
+	}
+	defer sess.Close()
+	if framedReader != nil {
+		startGRPCResponse(w)
+		defer func() {
+			_ = sess.Close()
+			framedReader.finish(w)
+		}()
 	}
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
@@ -469,33 +520,34 @@ func (s *Server) handleStreamUpPost(w http.ResponseWriter, r *http.Request, sess
 	// Matches Xray: heartbeat fires when Referer is present (legacy compat
 	// marker) or when obfs padding was accepted.
 	hasLegacyReferer := r.Header.Get("Referer") != ""
+	var heartbeat <-chan time.Time
+	var timer *time.Timer
 	if (hasLegacyReferer || obfsPaddingAccepted) && s.streamUpServerSecs.To > 0 {
-		done := make(chan struct{})
-		go func() {
-			tk := time.NewTimer(time.Duration(rangeRand(s.streamUpServerSecs)) * time.Second)
-			defer tk.Stop()
-			for {
-				select {
-				case <-done:
-					return
-				case <-tk.C:
-					if _, err := w.Write(bytes.Repeat([]byte{'X'}, int(rangeRand(s.codec.xpadRange)))); err != nil {
-						return
-					}
-					if fl, ok := w.(http.Flusher); ok {
-						fl.Flush()
-					}
-					tk.Reset(time.Duration(rangeRand(s.streamUpServerSecs)) * time.Second)
-				}
-			}
-		}()
-		<-r.Context().Done()
-		close(done)
-		return
+		timer = time.NewTimer(time.Duration(rangeRand(s.streamUpServerSecs)) * time.Second)
+		defer timer.Stop()
+		heartbeat = timer.C
 	}
-
-	// Wait until the session's GET ends (or POST itself errors).
-	<-r.Context().Done()
+	flusher, _ := w.(http.Flusher)
+	var writer io.WriteCloser = &flushWriter{w: w, flusher: flusher}
+	if s.opts.GRPCFraming {
+		writer = newGRPCWriter(writer)
+	}
+	defer writer.Close()
+	// Write heartbeats in the handler itself so no goroutine can write after
+	// trailers/END_STREAM. The upload also ends when its download session ends.
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-sess.closed:
+			return
+		case <-heartbeat:
+			if _, err := writer.Write(bytes.Repeat([]byte{'X'}, int(rangeRand(s.codec.xpadRange)))); err != nil {
+				return
+			}
+			timer.Reset(time.Duration(rangeRand(s.streamUpServerSecs)) * time.Second)
+		}
+	}
 }
 
 // handleStreamOne handles the stream-one mode: a single bidirectional HTTP
@@ -504,7 +556,13 @@ func (s *Server) handleStreamUpPost(w http.ResponseWriter, r *http.Request, sess
 func (s *Server) handleStreamOne(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.Header().Set("Cache-Control", "no-store")
-	if !s.opts.NoSSEHeader {
+	reader := r.Body
+	if s.opts.GRPCFraming {
+		framedReader := newGRPCReader(reader)
+		reader = framedReader
+		startGRPCResponse(w)
+		defer framedReader.finish(w)
+	} else if !s.opts.NoSSEHeader {
 		w.Header().Set("Content-Type", "text/event-stream")
 	}
 	w.WriteHeader(http.StatusOK)
@@ -513,13 +571,17 @@ func (s *Server) handleStreamOne(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 	}
 
-	writer := &flushWriter{w: w, flusher: flusher}
+	var writer io.WriteCloser = &flushWriter{w: w, flusher: flusher}
+	if s.opts.GRPCFraming {
+		writer = newGRPCWriter(writer)
+	}
+	done := make(chan struct{})
 	conn := &splitConn{
-		reader:  r.Body,
+		reader:  reader,
 		writer:  writer,
 		local:   nil,
 		remote:  parseRemote(r),
-		onClose: func() error { return nil },
+		onClose: func() error { close(done); return nil },
 	}
 
 	ctx := r.Context()
@@ -536,14 +598,13 @@ func (s *Server) handleStreamOne(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	source := sHttp.SourceAddress(r)
-	s.handler.NewConnectionEx(ctx, conn, source, M.Socksaddr{}, nil)
+	s.handler.NewConnectionEx(ctx, conn, source, M.Socksaddr{}, func(error) { _ = conn.Close() })
 
 	select {
 	case <-ctx.Done():
-	case <-finished:
+	case <-done:
 	}
-	// The context watcher normally closes this first, but keep the close here
-	// as well for the case where the handler exits through the finished path.
+	// Join any concurrent close before publishing trailers / END_STREAM.
 	_ = conn.Close()
 	close(finished)
 }

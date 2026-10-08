@@ -1,6 +1,9 @@
 package xhttp
 
 import (
+	"net/http"
+	"strings"
+
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
@@ -16,6 +19,30 @@ func (o Options) Validate() error {
 	case "", ModePacketUp, ModeStreamUp, ModeStreamOne, ModeStreamDown, ModeAuto:
 	default:
 		return E.New("xhttp: unsupported mode: ", o.Mode)
+	}
+
+	if o.GRPCFraming {
+		switch o.Mode {
+		case ModeStreamUp, ModeStreamOne, ModeAuto:
+		default:
+			return E.New("xhttp: grpc_framing requires stream-up, stream-one or server auto mode")
+		}
+		if o.NoGRPCHeader {
+			return E.New("xhttp: grpc_framing requires gRPC headers")
+		}
+		if o.Method != "" && o.Method != http.MethodPost {
+			return E.New("xhttp: grpc_framing requires POST")
+		}
+		if o.UplinkDataPlacement != "" && o.UplinkDataPlacement != PlacementBody {
+			return E.New("xhttp: grpc_framing requires body uplink placement")
+		}
+		// Use a stable /Service/Method path that RPC-aware proxies can route.
+		if !validGRPCServicePath(o.Path) {
+			return E.New("xhttp: grpc_framing path must name one gRPC service, for example /xhttp")
+		}
+		if o.XPaddingObfsMode && o.XPaddingPlacement == PlacementQuery {
+			return E.New("xhttp: grpc_framing does not support query padding on the RPC path")
+		}
 	}
 
 	if !validMetaPlacement(o.SessionPlacement) {
@@ -103,6 +130,24 @@ func (o Options) Validate() error {
 	}
 
 	return nil
+}
+
+func validGRPCServicePath(path string) bool {
+	if path == "" || path == "/" {
+		return true
+	}
+	service := strings.TrimSuffix(strings.TrimPrefix(path, "/"), "/")
+	for _, part := range strings.Split(service, ".") {
+		if part == "" {
+			return false
+		}
+		for i, ch := range part {
+			if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch == '_' || i > 0 && ch >= '0' && ch <= '9') {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // validMetaPlacement reports whether p is a legal placement for session/seq.

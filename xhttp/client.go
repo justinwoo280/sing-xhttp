@@ -125,6 +125,9 @@ func NewClientWithDownload(ctx context.Context, dialer N.Dialer, serverAddr M.So
 		}
 	}
 	options.Mode = mode
+	if options.GRPCFraming && mode != ModeStreamUp && mode != ModeStreamOne {
+		return nil, E.New("xhttp: grpc_framing requires stream-up or stream-one on the client")
+	}
 	md := defaultsForMode(mode)
 
 	// stream-up/stream-one need HTTP/2+ for bidirectional streaming.
@@ -573,6 +576,31 @@ func (c *Client) newRequest(ctx context.Context, method, sessionID, seqStr strin
 	return c.newRequestWithTransport(ctx, method, c.up, sessionID, seqStr, body)
 }
 
+func (c *Client) newStreamRequest(ctx context.Context, sessionID string, body io.Reader) (*http.Request, error) {
+	if !c.opts.GRPCFraming {
+		req, err := c.newRequest(ctx, c.method, sessionID, "", body)
+		if err == nil && !c.opts.NoGRPCHeader {
+			req.Header.Set("Content-Type", "application/grpc")
+		}
+		return req, err
+	}
+	// A fixed RPC method keeps routing independent of the per-session ID.
+	// The separate download GET continues to use the normal XHTTP placement.
+	req, err := c.newRequest(ctx, http.MethodPost, "", "", body)
+	if err != nil {
+		return nil, err
+	}
+	req.URL.Path = grpcPath(c.codec.basePath)
+	req.Header.Set("Content-Type", "application/grpc")
+	req.Header.Set("TE", "trailers")
+	req.Header.Set("Accept-Encoding", "identity")
+	req.Header.Del(grpcSessionHeader)
+	if sessionID != "" {
+		req.Header.Set(grpcSessionHeader, sessionID)
+	}
+	return req, nil
+}
+
 // newRequestWithTransport is like newRequest but uses the given transport set's
 // base URL and host.
 func (c *Client) newRequestWithTransport(ctx context.Context, method string, ts *transportSet, sessionID, seqStr string, body io.Reader) (*http.Request, error) {
@@ -661,51 +689,69 @@ func (c *Client) openDownload(ctx context.Context, sessionID string, xc2 *xmuxCl
 // --- stream-up ---
 
 func (c *Client) dialStreamUp(ctx context.Context, sessionID string, xc, xc2 *xmuxClient) (net.Conn, error) {
+	ctx, cancel := context.WithCancel(ctx)
 	downBody, remote, local, err := c.openDownload(ctx, sessionID, xc2)
 	if err != nil {
+		cancel()
 		c.releaseUsage(xc, xc2)
 		return nil, err
 	}
 
 	pr, pw := io.Pipe()
-	upReq, err := c.newRequest(ctx, c.method, sessionID, "", pr)
+	upReq, err := c.newStreamRequest(ctx, sessionID, pr)
 	if err != nil {
+		cancel()
+		pr.Close()
+		pw.Close()
 		downBody.Close()
 		c.releaseUsage(xc, xc2)
 		return nil, err
 	}
-	if !c.opts.NoGRPCHeader {
-		upReq.Header.Set("Content-Type", "application/grpc")
-	}
-
 	doneOnce := atomic.Bool{}
 	closeAll := func() error {
 		if doneOnce.Swap(true) {
 			return nil
 		}
+		cancel()
 		c.releaseUsage(xc, xc2)
+		_ = pr.Close()
 		_ = pw.Close()
 		return downBody.Close()
 	}
 
 	go func() {
 		resp, err := xc.conn.transport.RoundTrip(upReq)
-		if err != nil {
-			_ = pw.CloseWithError(err)
-			_ = downBody.Close()
+		if err == nil {
+			if resp.StatusCode != http.StatusOK {
+				err = E.New("xhttp: upload bad status: ", resp.Status)
+			} else {
+				body := resp.Body
+				if c.opts.GRPCFraming {
+					body, err = grpcResponseReader(resp)
+				}
+				if err == nil {
+					_, err = io.Copy(io.Discard, body)
+				}
+			}
+			resp.Body.Close()
+		}
+		if err == nil {
+			// The download may still contain the final response bytes. A clean
+			// upload EOF must not discard that independently buffered stream.
+			_ = pr.CloseWithError(io.ErrClosedPipe)
 			return
 		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			_ = pw.CloseWithError(E.New("xhttp: upload bad status: ", resp.Status))
-			_ = downBody.Close()
-		}
+		_ = pr.CloseWithError(err)
+		_ = closeAll()
 	}()
 
+	var writer io.Writer = pw
+	if c.opts.GRPCFraming {
+		writer = newGRPCWriter(pw)
+	}
 	return &splitConn{
 		reader:  downBody,
-		writer:  pw,
+		writer:  writer,
 		local:   local,
 		remote:  remote,
 		onClose: closeAll,
@@ -720,75 +766,62 @@ func (c *Client) dialStreamUp(ctx context.Context, sessionID string, xc, xc2 *xm
 // is fully symmetric so it always rides the upload transport; xc2 is only used
 // for openUsage bookkeeping when a separate download pool exists.
 func (c *Client) dialStreamOne(ctx context.Context, sessionID string, xc, xc2 *xmuxClient) (net.Conn, error) {
+	ctx, cancel := context.WithCancel(ctx)
 	pr, pw := io.Pipe()
-	req, err := c.newRequest(ctx, c.method, sessionID, "", pr)
+	req, err := c.newStreamRequest(ctx, sessionID, pr)
 	if err != nil {
+		cancel()
+		pr.Close()
+		pw.Close()
 		c.releaseUsage(xc, xc2)
 		return nil, err
 	}
-	if !c.opts.NoGRPCHeader {
-		req.Header.Set("Content-Type", "application/grpc")
-	}
 
+	body := newWaitReadCloser()
 	doneOnce := atomic.Bool{}
 	closeAll := func() error {
 		if doneOnce.Swap(true) {
 			return nil
 		}
+		cancel()
 		c.releaseUsage(xc, xc2)
+		_ = pr.Close()
 		_ = pw.Close()
-		return nil
+		return body.Close()
 	}
-
-	respChan := make(chan struct {
-		body   io.ReadCloser
-		err    error
-		remote net.Addr
-		local  net.Addr
-	}, 1)
 
 	go func() {
 		resp, err := xc.conn.transport.RoundTrip(req)
-		if err != nil {
-			respChan <- struct {
-				body   io.ReadCloser
-				err    error
-				remote net.Addr
-				local  net.Addr
-			}{nil, err, nil, nil}
-			return
-		}
-		if resp.StatusCode != http.StatusOK {
-			io.Copy(io.Discard, resp.Body)
+		if err == nil {
+			if resp.StatusCode != http.StatusOK {
+				err = E.New("xhttp: stream-one bad status: ", resp.Status)
+			} else {
+				reader := resp.Body
+				if c.opts.GRPCFraming {
+					reader, err = grpcResponseReader(resp)
+				}
+				if err == nil {
+					body.set(reader)
+					return
+				}
+			}
 			resp.Body.Close()
-			respChan <- struct {
-				body   io.ReadCloser
-				err    error
-				remote net.Addr
-				local  net.Addr
-			}{nil, E.New("xhttp: stream-one bad status: ", resp.Status), nil, nil}
-			return
 		}
-		respChan <- struct {
-			body   io.ReadCloser
-			err    error
-			remote net.Addr
-			local  net.Addr
-		}{resp.Body, nil, c.up.serverAddr.TCPAddr(), nil}
+		body.closeWithError(err)
+		_ = pr.CloseWithError(err)
+		_ = closeAll()
 	}()
 
-	result := <-respChan
-	if result.err != nil {
-		_ = pw.Close()
-		c.releaseUsage(xc, xc2)
-		return nil, result.err
+	var writer io.Writer = pw
+	if c.opts.GRPCFraming {
+		writer = newGRPCWriter(pw)
 	}
-
+	// As with gRPC-lite, expose the upload writer before response headers.
+	// Some proxies wait for the first message before forwarding those headers.
 	return &splitConn{
-		reader:  result.body,
-		writer:  pw,
-		local:   result.local,
-		remote:  result.remote,
+		reader:  body,
+		writer:  writer,
+		remote:  c.up.serverAddr.TCPAddr(),
 		onClose: closeAll,
 	}, nil
 }
@@ -1037,7 +1070,7 @@ type waitReadCloser struct {
 	mu     sync.Mutex
 	body   io.ReadCloser
 	err    error
-	closed atomic.Bool
+	closed bool
 }
 
 func newWaitReadCloser() *waitReadCloser {
@@ -1046,21 +1079,23 @@ func newWaitReadCloser() *waitReadCloser {
 
 func (w *waitReadCloser) set(body io.ReadCloser) {
 	w.mu.Lock()
+	if w.closed || w.err != nil || w.body != nil {
+		w.mu.Unlock()
+		_ = body.Close()
+		return
+	}
 	w.body = body
-	closed := w.closed.Load()
 	w.mu.Unlock()
 	w.once.Do(func() {
 		close(w.ready)
 	})
-	// If Close raced ahead of set, close the just-arrived body now.
-	if closed {
-		_ = body.Close()
-	}
 }
 
 func (w *waitReadCloser) closeWithError(err error) {
 	w.mu.Lock()
-	w.err = err
+	if !w.closed && w.err == nil {
+		w.err = err
+	}
 	w.mu.Unlock()
 	w.once.Do(func() {
 		close(w.ready)
@@ -1084,12 +1119,16 @@ func (w *waitReadCloser) Read(p []byte) (int, error) {
 }
 
 func (w *waitReadCloser) Close() error {
-	w.closed.Store(true)
-	// Unblock any pending Read.
-	w.once.Do(func() { close(w.ready) })
 	w.mu.Lock()
+	w.closed = true
 	body := w.body
+	w.body = nil
+	if w.err == nil {
+		w.err = net.ErrClosed
+	}
 	w.mu.Unlock()
+	// Unblock any pending Read, and close each response body exactly once.
+	w.once.Do(func() { close(w.ready) })
 	if body != nil {
 		return body.Close()
 	}
